@@ -1,13 +1,21 @@
 {
   "name": "dsh-doubao-work",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "type": "module",
   "main": "index.js",
+  "exports": {
+    ".": "./index.js",
+    "./client": "./client.js",
+    "./package.json": "./package.json"
+  },
   "description": "把豆包工作免费额度（DeepSeek V4.1 Flash / 豆包 2.1 Lite，0.01x）接入 DeepSeek Harness 的模型插件",
   "files": [
     "index.js",
+    "client.js",
     "doubao.js",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "tools",
+    "docs"
   ],
   "keywords": [
     "dsh-plugin",
@@ -24,6 +32,11 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": false,
+      "inject": []
     }
   }
 }
