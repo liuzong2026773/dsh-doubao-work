@@ -105,7 +105,11 @@ window.__ModuleLoader__.load({
         setBusy('add')
         try {
           const r = formMode === 'update' ? await api.update(form) : await api.add(form)
-          setLog((formMode === 'update' ? '已更新账号 ' : '已添加账号 ') + r.id)
+          const p = r && r.parse
+          const head = (formMode === 'update' ? '已更新账号 ' : '已添加账号 ') + r.id
+          const detail = p ? '｜' + p.describe : ''
+          const warn = p && p.warnings && p.warnings.length ? '\n注意：\n- ' + p.warnings.join('\n- ') : ''
+          setLog(head + detail + warn)
           setForm({ id: '', remark: '', cookie: '' })
           setShowAdd(false)
         } catch (e) { setLog('保存失败：' + e.message) }
@@ -142,8 +146,8 @@ window.__ModuleLoader__.load({
 
         showAdd ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderRadius: 10, border: '1px solid var(--dsw-alias-border-l2, #e3e6ea)' } },
           h('div', { style: S.mute }, formMode === 'update'
-            ? '粘贴该账号新的整段 Cookie（Cookie 过期时用这个换，不用删了再加）；保存后立即生效。'
-            : '把浏览器里豆包网页版的整段 Cookie 粘进来；保存后立即生效，无需重启。'),
+            ? '粘贴该账号新的 Cookie（换号过期时用这个换，不用删了再加）：整段 Cookie、`Cookie:` 请求头、Copy as cURL 都能直接贴，保存后立即生效。'
+            : '把豆包网页版的登录态粘进来：整段 Cookie、`Cookie:` 请求头、浏览器「Copy as cURL」、扩展导出的 JSON / cookies.txt 都能自动识别，保存后立即生效，无需重启。'),
           h('div', { style: S.row },
             h('input', {
               placeholder: 'ID（可空，如 acc-2）', value: form.id, disabled: formMode === 'update',
@@ -152,7 +156,7 @@ window.__ModuleLoader__.load({
             }),
             h('input', { placeholder: '备注（如：小号）', value: form.remark, style: { flex: '1 1 160px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
               onChange: e => setForm({ ...form, remark: e.target.value }) })),
-          h('textarea', { placeholder: 'Cookie（sessionid=...; sid_guard=...）', rows: 3, value: form.cookie,
+          h('textarea', { placeholder: '粘贴 Cookie，或 Cookie: 请求头 / Copy as cURL / 扩展导出的 JSON', rows: 3, value: form.cookie,
             style: { width: '100%', padding: 8, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 12 },
             onChange: e => setForm({ ...form, cookie: e.target.value }) }),
           h('div', { style: S.row },
@@ -164,7 +168,9 @@ window.__ModuleLoader__.load({
             ['账号', '状态', '今日请求', '预估剩余', '累计字数', '最近错误', '操作']
               .map(c => h('th', { key: c, style: S.th }, c)))),
           h('tbody', null, accounts.length === 0
-            ? h('tr', null, h('td', { style: S.td, colSpan: 7 }, h('span', { style: S.mute }, '还没有账号：在插件目录的 accounts.json 里加一条，或用 tools/accounts.mjs 添加。')))
+            ? h('tr', null, h('td', { style: S.td, colSpan: 7 }, h('span', { style: S.mute },
+              '还没有账号：点上面「添加账号」粘贴 Cookie 即可（整段 Cookie、`Cookie:` 请求头、浏览器「Copy as cURL」、扩展导出的 JSON 都能识别），保存后立即生效。'
+              + (data.accountsPath ? ' 也可直接编辑账号文件 ' + data.accountsPath + '（改完保存即生效，不用重启）。' : ''))))
             : accounts.map(a => h('tr', { key: a.id },
               h('td', { style: S.td }, a.remark || a.id),
               h('td', { style: { ...S.td, color: statusColor(a.status) } }, String(a.status)),
@@ -179,7 +185,8 @@ window.__ModuleLoader__.load({
                 h('span', { style: { display: 'inline-block', width: 6 } }),
                 h('button', { style: S.btn, disabled: !!busy, onClick: () => onRemove(a) }, '删除')))))),
 
-        h('div', { style: S.mute }, '「预估剩余」按 200 次/天（周一翻倍）自记账推算，平台不提供余量接口。'),
+        h('div', { style: S.mute }, '「预估剩余」按 200 次/天（周一翻倍）自记账推算，平台不提供余量接口。'
+          + (data.accountsPath ? '｜账号文件：' + data.accountsPath : '')),
         log ? h('pre', { style: S.pre }, log) : null)
     }
 

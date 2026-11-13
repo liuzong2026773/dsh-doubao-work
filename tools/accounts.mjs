@@ -4,7 +4,10 @@
  *
  *   node tools/accounts.mjs list
  *   node tools/accounts.mjs add --id acc-2 --remark 小号 --cookie-file /tmp/cookie.txt
+ *   node tools/accounts.mjs add --id acc-2 --remark 小号 --cookie-file /tmp/cookie.txt
  *   node tools/accounts.mjs add --id acc-2 --remark 小号            # 从 stdin 读 Cookie
+ *     （cookie-file / stdin 里放的内容可以是整段 Cookie、`Cookie:` 请求头、
+ *       整页请求头、Copy as cURL 的命令、扩展导出的 JSON 或 cookies.txt，会自动识别）
  *   node tools/accounts.mjs enable  --id acc-2
  *   node tools/accounts.mjs disable --id acc-2
  *   node tools/accounts.mjs remove  --id acc-2
@@ -17,6 +20,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { dataPaths } from '../paths.js';
+import { parseCookieInput, describeParse } from '../cookie-input.js';
 
 const dir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 const paths = dataPaths({ legacyDir: dir });
@@ -58,14 +62,19 @@ if (cmd === 'list') {
 } else if (cmd === 'add') {
   const id = opt('id', 'acc-' + (data.accounts.length + 1));
   if (data.accounts.some(a => a.id === id)) { console.error('id 已存在: ' + id); process.exit(1); }
-  let cookie = '';
+  let raw = '';
   const cf = opt('cookie-file');
-  if (cf) cookie = fs.readFileSync(cf, 'utf8').trim();
-  else cookie = fs.readFileSync(0, 'utf8').trim();
-  if (cookie.length < 20) { console.error('Cookie 太短，疑似无效'); process.exit(1); }
+  if (cf) raw = fs.readFileSync(cf, 'utf8');
+  else raw = fs.readFileSync(0, 'utf8');
+  // 与设置页同一套识别：整段 Cookie / Cookie: 请求头 / 整页请求头 / Copy as cURL / JSON / cookies.txt
+  const parsed = parseCookieInput(raw);
+  if (!parsed.pairs) { console.error('没能解析出 Cookie 字段：' + parsed.warnings.join('；')); process.exit(1); }
+  if (parsed.cookie.length < 20) { console.error('Cookie 太短（' + parsed.cookie.length + ' 字符），疑似无效'); process.exit(1); }
+  const cookie = parsed.cookie;
   data.accounts.push({ id, remark: opt('remark', ''), cookie, enabled: true });
   save(data);
-  console.log('已添加 ' + id + '（cookie ' + cookie.length + ' 字符）');
+  console.log('已添加 ' + id + '（' + describeParse(parsed) + '，' + cookie.length + ' 字符）');
+  for (const w of parsed.warnings) console.log('  注意：' + w);
 } else if (cmd === 'enable' || cmd === 'disable' || cmd === 'remove') {
   const id = opt('id');
   const i = data.accounts.findIndex(a => a.id === id);

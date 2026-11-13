@@ -421,4 +421,140 @@ ok('VERSION 与 package.json 一致', async () => {
   assert.equal(mod.VERSION, pkg.version);
 });
 
+// ---------------- 1.2.6：粘贴内容智能解析 ----------------
+console.log('Cookie 粘贴解析');
+const { parseCookieInput, describeParse } = await import('../cookie-input.js');
+const RAW_COOKIE = 'sessionid=abcdefghijklmnop; sid_guard=qrstuvwxyz0123; uid_tt=456789';
+
+ok('整段 Cookie 原样规范化', () => {
+  const r = parseCookieInput(RAW_COOKIE);
+  assert.equal(r.format, 'raw');
+  assert.equal(r.cookie, RAW_COOKIE);
+  assert.equal(r.pairs, 3);
+  assert.deepEqual(r.warnings, []);
+});
+
+ok('带 Cookie: 头名的一行能剥掉头名', () => {
+  const r = parseCookieInput('Cookie: ' + RAW_COOKIE);
+  assert.equal(r.format, 'cookie-header');
+  assert.equal(r.cookie, RAW_COOKIE);
+});
+
+ok('整页请求头里只取 cookie 头', () => {
+  const r = parseCookieInput([
+    'accept: */*',
+    'cookie: ' + RAW_COOKIE,
+    'user-agent: Mozilla/5.0',
+    'content-type: application/json',
+  ].join('\n'));
+  assert.equal(r.format, 'headers');
+  assert.equal(r.cookie, RAW_COOKIE);
+});
+
+ok('Copy as cURL：-H cookie 与续行都认', () => {
+  const curl = [
+    "curl 'https://www.doubao.com/api/v1/chat/completions' \\",
+    "  -H 'accept: */*' \\",
+    "  -H 'cookie: " + RAW_COOKIE + "' \\",
+    "  --data-raw '{\"a\":1}'",
+  ].join('\n');
+  const r = parseCookieInput(curl);
+  assert.equal(r.format, 'curl');
+  assert.equal(r.cookie, RAW_COOKIE);
+});
+
+ok('Copy as cURL：双引号 -b 形式', () => {
+  const r = parseCookieInput('curl https://www.doubao.com -b "' + RAW_COOKIE + '"');
+  assert.equal(r.format, 'curl');
+  assert.equal(r.cookie, RAW_COOKIE);
+});
+
+ok('cURL 里没有 cookie 头时给出可执行的提示', () => {
+  const r = parseCookieInput("curl 'https://www.doubao.com' -H 'accept: */*'");
+  assert.equal(r.pairs, 0);
+  assert.ok(r.warnings.some(w => w.startsWith('curl_no_cookie')), r.warnings.join('|'));
+});
+
+ok('浏览器扩展导出的 JSON 数组', () => {
+  const r = parseCookieInput(JSON.stringify([
+    { name: 'sessionid', value: 'abcdefghijklmnop', domain: '.doubao.com' },
+    { name: 'sid_guard', value: 'qrstuvwxyz0123' },
+  ]));
+  assert.equal(r.format, 'json');
+  assert.equal(r.cookie, 'sessionid=abcdefghijklmnop; sid_guard=qrstuvwxyz0123');
+});
+
+ok('Netscape cookies.txt', () => {
+  const r = parseCookieInput([
+    '# Netscape HTTP Cookie File',
+    '.doubao.com\tTRUE\t/\tTRUE\t1800000000\tsessionid\tabcdefghijklmnop',
+    '.doubao.com\tTRUE\t/\tTRUE\t1800000000\tsid_guard\tqrstuvwxyz0123',
+  ].join('\n'));
+  assert.equal(r.format, 'netscape');
+  assert.equal(r.cookie, 'sessionid=abcdefghijklmnop; sid_guard=qrstuvwxyz0123');
+});
+
+ok('同名 Cookie 取最后一次', () => {
+  const r = parseCookieInput('sessionid=old_value_a; sid_guard=qrstuvwxyz0123; sessionid=new_value_b');
+  assert.match(r.cookie, /sessionid=new_value_b/);
+  assert.ok(!/sessionid=old_value_a/.test(r.cookie));
+  assert.ok(r.warnings.some(w => w.startsWith('dup_keys')));
+});
+
+ok('没有登录态字段时提示（不当成有效 Cookie）', () => {
+  const r = parseCookieInput('ttwid=abc123def456ghi789; web_id=123');
+  assert.ok(r.warnings.some(w => w.startsWith('not_logged_in')), r.warnings.join('|'));
+});
+
+ok('非 Cookie 文本不会当成 Cookie', () => {
+  const r = parseCookieInput('这是一段随便粘进来的中文说明文字');
+  assert.equal(r.pairs, 0);
+  assert.ok(r.warnings.some(w => w.startsWith('no_pair')));
+});
+
+ok('describeParse 用人话概括识别结果', () => {
+  assert.match(describeParse(parseCookieInput('curl x -H "cookie: sessionid=aaaaaaaaaaaa; sid_guard=bbbbbbbbbbbb"')), /cURL 命令.*2 个字段/);
+});
+
+console.log('Cookie 解析接入管理接口');
+const CURL_PASTE = [
+  "curl 'https://www.doubao.com/alice/get_chat' \\",
+  "  -H 'accept: */*' \\",
+  "  -H 'cookie: " + RAW_COOKIE + "'",
+].join('\n');
+const addCurl = await call('/doubao/account/add', { id: 'acc-curl', remark: 'cURL 粘的', cookie: CURL_PASTE });
+ok('粘 cURL 也能添加成功并回报解析结果', () => {
+  assert.equal(addCurl.code, 200);
+  const b = JSON.parse(addCurl.body);
+  assert.equal(b.parse.format, 'curl');
+  assert.equal(b.parse.pairs, 3);
+});
+const curlStored = JSON.parse(fs.readFileSync(ACCOUNTS_JSON, 'utf8')).accounts.find(a => a.id === 'acc-curl');
+ok('入库的是规范化后的 Cookie', () => assert.equal(curlStored.cookie, RAW_COOKIE));
+
+const addJunk = await call('/doubao/account/add', { id: 'acc-junk', cookie: '随便粘的一句话' });
+ok('粘错内容返回 400 并带原因', () => {
+  assert.equal(addJunk.code, 400);
+  assert.ok(JSON.parse(addJunk.body).warnings.length > 0);
+});
+
+const updCurl = await call('/doubao/account/update', {
+  id: 'acc-curl',
+  cookie: "curl x -H 'cookie: sessionid=zzzzzzzzzzzzzzz; sid_guard=yyyyyyyyyyyyyyyy'",
+});
+ok('换 Cookie 也走同一套解析', () => {
+  assert.equal(updCurl.code, 200);
+  assert.equal(JSON.parse(updCurl.body).parse.format, 'curl');
+});
+const updStored = JSON.parse(fs.readFileSync(ACCOUNTS_JSON, 'utf8')).accounts.find(a => a.id === 'acc-curl');
+ok('换后的 Cookie 已规范化入库', () => assert.equal(updStored.cookie, 'sessionid=zzzzzzzzzzzzzzz; sid_guard=yyyyyyyyyyyyyyyy'));
+
+await call('/doubao/account/remove', { id: 'acc-curl' });
+
+const stPath = JSON.parse((await call('/doubao/status')).body);
+ok('status 暴露数据目录与账号文件路径（面板空态要用）', () => {
+  assert.equal(path.resolve(stPath.dataDir), path.resolve(DATA_DIR));
+  assert.ok(String(stPath.accountsPath).endsWith('accounts.json'), stPath.accountsPath);
+});
+
 console.log('\n全部通过：' + passed + ' 项');

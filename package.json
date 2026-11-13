@@ -1,6 +1,6 @@
 {
   "name": "dsh-doubao-work",
-  "version": "1.2.5",
+  "version": "1.2.6",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,6 +13,7 @@
     "index.js",
     "client.js",
     "doubao.js",
+    "cookie-input.js",
     "host.js",
     "paths.js",
     "cordis.patch.yml",

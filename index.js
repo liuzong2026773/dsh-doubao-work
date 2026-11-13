@@ -10,6 +10,7 @@
 
 import { Schema, LlmAdapter, LlmError, resolvedFrom } from './host.js';
 import { dataPaths } from './paths.js';
+import { parseCookieInput, describeParse } from './cookie-input.js';
 import { DoubaoClient, DoubaoError, BUILTIN_MODELS, conversationKey } from './doubao.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -76,7 +77,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.2.5';
+export const VERSION = '1.2.6';
 
 /**
  * 配置默认值。
@@ -393,6 +394,9 @@ export function apply(ctx, rawConfig) {
             },
             conversations: client.convMap.size,
             contextReuse: config.contextReuse !== false,
+            // 账号文件到底在哪：面板空态文案与排障都要用它（1.2.5 起不再在插件目录）
+            dataDir: files.dir,
+            accountsPath: files.accountsPath,
             // 宿主包从哪来的：bare=常规解析；install:<dir>=从安装目录取（profile 安装的正常情况）
             runtime: { host: { ...resolvedFrom }, version: VERSION },
             // 诊断字段：宿主最近一次实际下发的模型名 + 会话复用情况
@@ -499,8 +503,16 @@ export function apply(ctx, rawConfig) {
           if (guard(req, res)) return;
           const body = await parseBody(req);
           if (!body) return json(res, 400, { error: '请求体不是合法 JSON' });
-          const cookie = typeof body.cookie === 'string' ? body.cookie.trim() : '';
-          if (cookie.length < 20) return json(res, 400, { error: 'Cookie 太短，疑似无效' });
+          // 粘贴内容不再要求「只有整段 Cookie 这一种形状」：cURL / 请求头 / JSON / cookies.txt
+          // 先统一解析成规范串，再入库（见 cookie-input.js）
+          const parsed = parseCookieInput(body.cookie);
+          if (!parsed.pairs) {
+            return json(res, 400, { error: '没能从粘贴内容里解析出任何 Cookie 字段', format: parsed.format, warnings: parsed.warnings });
+          }
+          if (parsed.cookie.length < 20) {
+            return json(res, 400, { error: `Cookie 太短（${parsed.cookie.length} 字符），疑似无效`, format: parsed.format, warnings: parsed.warnings });
+          }
+          const cookie = parsed.cookie;
           const remark = typeof body.remark === 'string' ? body.remark.trim().slice(0, 64) : '';
           const list = readAccountsFile();
           let id = typeof body.id === 'string' ? body.id.trim() : '';
@@ -513,7 +525,8 @@ export function apply(ctx, rawConfig) {
           if (list.some(a => a.id === id)) return json(res, 409, { error: 'id 已存在：' + id });
           list.push({ id, remark, cookie, enabled: true });
           writeAccountsFile(list);
-          json(res, 200, { ok: true, id });
+          // 把识别结果回给面板：用户粘的是 cURL 还是整段 Cookie，提取了几个字段，有什么要注意
+          json(res, 200, { ok: true, id, parse: { format: parsed.format, pairs: parsed.pairs, describe: describeParse(parsed), warnings: parsed.warnings } });
         },
       });
 
@@ -525,8 +538,13 @@ export function apply(ctx, rawConfig) {
           if (guard(req, res)) return;
           const body = await parseBody(req);
           if (!body || typeof body.id !== 'string' || !ID_RE.test(body.id)) return json(res, 400, { error: 'id 非法' });
-          const cookie = typeof body.cookie === 'string' ? body.cookie.trim() : '';
-          if (body.cookie !== undefined && cookie.length < 20) return json(res, 400, { error: 'Cookie 太短，疑似无效' });
+          // 换 Cookie 走同一套识别：cURL / 请求头 / JSON / cookies.txt 都能直接贴
+          const parsed = body.cookie === undefined ? null : parseCookieInput(body.cookie);
+          if (parsed) {
+            if (!parsed.pairs) return json(res, 400, { error: '没能从粘贴内容里解析出任何 Cookie 字段', format: parsed.format, warnings: parsed.warnings });
+            if (parsed.cookie.length < 20) return json(res, 400, { error: `Cookie 太短（${parsed.cookie.length} 字符），疑似无效`, format: parsed.format, warnings: parsed.warnings });
+          }
+          const cookie = parsed ? parsed.cookie : '';
           const list = readAccountsFile();
           let a = list.find(x => x.id === body.id);
           if (!a) {
@@ -542,7 +560,7 @@ export function apply(ctx, rawConfig) {
           // Cookie 变了就清掉运行态的"失效"标记，下次调用立刻重试
           const st = client.accountState ? client.accountState(body.id) : null;
           if (st) { st.authError = false; st.lastError = ''; st.coolUntil = 0; }
-          json(res, 200, { ok: true, id: a.id });
+          json(res, 200, { ok: true, id: a.id, parse: parsed ? { format: parsed.format, pairs: parsed.pairs, describe: describeParse(parsed), warnings: parsed.warnings } : null });
         },
       });
 

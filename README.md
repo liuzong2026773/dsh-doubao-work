@@ -48,7 +48,12 @@
 
 1. 电脑浏览器打开 [www.doubao.com](https://www.doubao.com) 并登录
 2. `F12` → Network → 随便点一个请求 → Request Headers → 复制整条 `Cookie` 值
-3. 粘贴到插件配置 `accounts[0].cookie`
+3. 粘到设置页「添加账号」的框里（或插件配置 `accounts[0].cookie`）
+
+> 1.2.6 起粘贴框会**自动识别形状**，不用自己剪裁：整段 Cookie、`Cookie: …` 请求头、
+> 整个 Request Headers 面板、浏览器右键「Copy as cURL」的整条命令、EditThisCookie /
+> Cookie-Editor 导出的 JSON、Netscape `cookies.txt` 都能直接贴。识别结果会回显
+> （「识别为『cURL 命令』，提取 14 个字段」），缺登录态字段时会提示。
 
 ## 功能
 
@@ -84,10 +89,11 @@
 - 每次调用前检查文件修改时间，**改完保存立即生效**（加号、换 Cookie、临时禁用 `enabled: false` 都不用重启）
 - 同 `id` 时文件账号优先于配置面板账号
 - **导出**：复制这个 `accounts.json` 就是完整账号备份
-- **导入**：把文件放进另一台设备的插件目录即完成迁移
-- 运行状态（冷却倒计时/用量统计）另存于插件目录 `gateway-state.json`，不影响账号数据
+- **导入**：把文件放到另一台设备的**数据目录**（默认 `~/.dsh/doubao-work/`）即完成迁移
+- 运行状态（冷却倒计时/用量统计）另存于同一数据目录的 `gateway-state.json`，不影响账号数据
 
-> 手机 DSH 小技巧：如果手机上不便直接编辑文件，可以直接对 DSH 说“把这段 Cookie 写进插件目录的 accounts.json，格式是……”让它代写。
+> 手机 DSH 小技巧：如果手机上不便直接编辑文件，可以直接对 DSH 说“把这段 Cookie 写进 `<dshHome>/doubao-work/accounts.json`，格式是……”让它代写；
+> 或者用设置页的粘贴框（1.2.6 起整段 Cookie / `Cookie:` 头 / Copy as cURL 都能直接贴）。
 
 ## 获取新账号的 Cookie
 
@@ -113,6 +119,7 @@ dsh-doubao-work/
 ├── doubao.js          # 上游内核：Cookie 直连 / SSE 解析 / 账号池 / 冷却 / 会话复用
 ├── host.js            # 宿主包解析：从安装目录取 @deepseek-ai/*（profile 安装的关键）
 ├── paths.js           # 数据目录：Cookie/状态放 <dshHome>/doubao-work，升级不丢
+├── cookie-input.js    # 粘贴解析：整段 Cookie / 请求头 / cURL / JSON / cookies.txt → 规范串
 ├── client.js          # 浏览器半身：设置页「豆包工作」
 ├── package.json
 ├── cordis.patch.yml
@@ -132,11 +139,13 @@ dsh-doubao-work/
 
 页面上还能「添加账号」（直接粘贴整段 Cookie，保存即生效）、「停用/启用」、「换 Cookie」与「删除」。
 停用的账号仍然显示在列表里（状态显示「已停用」），所以随时可以点回来启用。
+「添加账号 / 换 Cookie」的粘贴框会自动识别六种粘贴形状并回显识别结果（见上文「获取 Cookie」），
+空态文案与页脚会直接显示当前账号文件路径（数据目录可能被 `dataDir` 改过，写死路径会误导）。
 
 离线自检（不重启、不联网、不耗额度）：
 
 ```bash
-node tests/smoke.mjs      # 契约/路由/账号管理/签到/数据目录/错误码/复用规划/流协议，共 66 项
+node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/签到/数据目录/错误码/复用规划/流协议，共 84 项
 node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到，共 17 项
 ELECTRON_RUN_AS_NODE=1 DSH_HOST_MODULES="<安装目录>/app.asar/dsh/node_modules" \
   "<安装目录>/DeepSeek Harness.exe" tests/profile-install.mjs   # 模拟 profile 安装，6 项
@@ -188,9 +197,12 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
 ## 状态接口（插件内，需重启 DSH 后生效）
 
 - `GET  /doubao/status`（或 `/api/doubao/status`）— 账号池（含停用）+ 今日用量 + 会话数 +
-  `runtime.host`（宿主包解析来源，排查「装上了但没生效」先看这里）
+  `runtime.host`（宿主包解析来源，排查「装上了但没生效」先看这里）+
+  `dataDir` / `accountsPath`（账号文件到底在哪，面板空态就用它）
 - `POST /doubao/check` — 逐账号健康检查
-- `POST /doubao/account/add|update|enable|remove` — 账号增删改启停（`update` 用于换 Cookie，不用删了再加）
+- `POST /doubao/account/add|update|enable|remove` — 账号增删改启停（`update` 用于换 Cookie，不用删了再加）。
+  `add`/`update` 的 Cookie 字段接受任意常见粘贴形状，成功时返回 `parse`
+  （`{format, pairs, describe, warnings}`），失败时返回 400 + `format` + `warnings` 说明为什么没解析出来
 - `POST /doubao/checkin` — 全部账号（或 `{"id":"acc-1"}` 单号）每日签到，返回 ok/already/skipped/failed 汇总
 - `POST /doubao/checkin/status` — 单账号今日签到状态（`{"id":"acc-1"}`）
 
@@ -252,8 +264,25 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 - 8 个未抓 `model_item_key`（豆包 2.1 Pro / Kimi K3 / GLM 5.3 等），抓到即可加进 `extraModels`。
 - 签到接口 1.2.3 已抓到并接入（`/alice/ug/campaign/v3/detail/` 查状态 + `/alice/ug/campaign/landing/checkin` 执行，
   详见 docs 与 `/doubao/checkin`）。待办：面板上的「一键签到」按钮接线，以及把每日签到做成定时任务。
+- **一键从本机浏览器导入 Cookie**（Chrome/Edge + DPAPI）还没做：读浏览器 Cookie 库属于读取用户隐私数据，
+  需要用户明确同意后再实现；另外 Chrome 127+ 的 App-Bound 加密会让 DPAPI 解不开，得按版本降级处理。
+  现状是「复制粘贴」，1.2.6 已把粘贴这一步做到能直接吃 cURL / 请求头 / JSON / cookies.txt。
+- 扫码 / 短信登录仍不可行：登录页走 `accounts.doubao.com` 的 webmssdk 风控签名，纯后端模拟注册接口
+  只会得到 `非法应用(22)`；真扫码需要 Electron 内嵌窗口读登录后 Cookie，而 DSH 插件 API 目前不暴露窗口能力。
 
 ## 更新记录
+
+- **1.2.6**（2026-11-13，粘贴这一步做顺）：
+  - **粘贴框不再只认「整段 Cookie」**：新增 `cookie-input.js`，把六种常见粘贴形状统一解析成规范串——
+    整段 Cookie、`Cookie: …` 请求头、整个 Request Headers 面板、右键「Copy as cURL」的整条命令
+    （`-H 'cookie: …'` 与 `-b "…"` 都认，含 bash `\` / cmd `^` 续行）、扩展导出的 JSON、Netscape `cookies.txt`。
+    同名字段取最后一次，非 Cookie 正文会被丢掉而不是写成噪声字段；缺 `sessionid`/`sid_guard` 时提示
+    「可能不是登录状态下拷的」。`/doubao/account/add|update` 成功时回 `parse`（识别成什么、几个字段、
+    有哪些提醒），失败时回 400 + 原因；`tools/accounts.mjs add` 走同一套解析。
+  - **面板空态与页脚改成真实路径**：空态不再说「在插件目录的 accounts.json 里加一条」（1.2.5 起已搬到
+    数据目录，这句话会把用户指错地方），改为「点添加账号粘贴即可」，并直接显示 `/doubao/status` 返回的
+    `accountsPath`；状态接口新增 `dataDir` / `accountsPath` 两个字段。
+  - **测试**：smoke 从 66 项增至 84 项（新增粘贴解析 12 项 + 管理接口端到端 5 项 + 路径暴露 1 项）。
 
 - **1.2.5**（2026-11-13，修的是「装上就加载不了」）：
   - **profile 安装后加载失败（P0，已修）**：宿主的 loader 只把**插件入口那一个裸名**重定向到安装目录
