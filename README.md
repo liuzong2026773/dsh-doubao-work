@@ -93,13 +93,34 @@ dsh-doubao-work/
 
 `standalone/` 目录是同内核的独立 OpenAI 兼容网关（`node index.js`，默认 `127.0.0.1:3040/v1`），适合不想装插件、或想给其他 OpenAI 客户端/中转站供流的场景。配置 `config.json` + `accounts.json`（填 Cookie）后启动。
 
+## 本地面板
+
+```bash
+node tools/panel.mjs        # http://127.0.0.1:3041
+```
+
+只监听 127.0.0.1。页面能看到：账号状态、今日请求数、**预估剩余额度**（按 200/天、周一翻倍推算）、
+累计字数、最近错误，并支持「健康检查」「停用/启用」「删除账号」。
+
+> 平台没有提供余量查询接口（实测），所以"剩余"是**按调用次数自记账估算**，不是官方数字。
+
 ## 运维小工具（无需面板）
 
 ```bash
 node tools/status.mjs          # 账号池状态：冷却到几点、累计用量、最近错误
 node tools/status.mjs --check  # 额外校验每个账号 Cookie 是否还有效
 node tools/status.mjs --quota  # 额外查询每个账号的订阅额度
+
+node tools/accounts.mjs list                     # 列出账号
+node tools/accounts.mjs add --id acc-2 --remark 小号 --cookie-file /tmp/c.txt
+node tools/accounts.mjs disable --id acc-2
+node tools/accounts.mjs export --out /tmp/backup.json
 ```
+
+## 状态接口（插件内，需重启 DSH 后生效）
+
+- `GET  /doubao/status` — 账号池 + 今日用量 + 会话数
+- `POST /doubao/check` — 逐账号健康检查
 
 ## 多轮上下文（contextReuse）
 
