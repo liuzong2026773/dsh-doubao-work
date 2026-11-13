@@ -233,6 +233,48 @@ export function apply(ctx, config) {
           res.end(body);
         },
       });
+      const readAccountsFile = () => {
+        try {
+          const d = JSON.parse(fs.readFileSync(path.join(pluginDir, 'accounts.json'), 'utf8').replace(/^\uFEFF/, ''));
+          return Array.isArray(d) ? d : (d.accounts || []);
+        } catch (e) { return []; }
+      };
+      const writeAccountsFile = (list) => {
+        const p = path.join(pluginDir, 'accounts.json');
+        fs.writeFileSync(p, JSON.stringify({ accounts: list }, null, 2), { mode: 0o600 });
+        try { fs.chmodSync(p, 0o600); } catch (e) { /* ignore */ }
+      };
+      const readBody = (req) => new Promise(resolve => {
+        let b = '';
+        req.on('data', c => { b += c; });
+        req.on('end', () => resolve(b));
+      });
+
+      web.register({
+        kind: 'exact',
+        path: '/doubao/account/enable',
+        handler: async (req, res) => {
+          const body = JSON.parse((await readBody(req)) || '{}');
+          const list = readAccountsFile();
+          const a = list.find(x => x.id === body.id);
+          if (!a) { res.writeHead(404, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'not found' })); }
+          a.enabled = !!body.enabled;
+          writeAccountsFile(list);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        },
+      });
+      web.register({
+        kind: 'exact',
+        path: '/doubao/account/remove',
+        handler: async (req, res) => {
+          const body = JSON.parse((await readBody(req)) || '{}');
+          writeAccountsFile(readAccountsFile().filter(x => x.id !== body.id));
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true }));
+        },
+      });
+
       web.register({
         kind: 'exact',
         path: '/doubao/check',
