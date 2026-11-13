@@ -69,16 +69,26 @@ async function mapLimit(items, limit, fn) {
   }));
 }
 
+// 索引里的真实 mode：带 shebang 的脚本是 100755，硬编码 100644 会把可执行位推丢
+const modeOf = new Map();
+for (const line of git(['-c', 'core.quotepath=false', 'ls-files', '-s']).split('\n').filter(Boolean)) {
+  const m = line.match(/^(\d{6}) [0-9a-f]+ \d+\t(.+)$/);
+  if (m) modeOf.set(m[2], m[1]);
+}
+
 const entries = new Array(files.length);
 await mapLimit(files, 4, async (f, k) => {
-  const content = fs.readFileSync(path.join(pluginDir, f));
-  // 删除检测：工作区里已不存在但索引仍收录的文件，用 null sha 从 tree 中移除
-  if (!fs.existsSync(path.join(pluginDir, f))) { entries[k] = { path: f, mode: '100644', type: 'blob', sha: null }; return; }
+  const abs = path.join(pluginDir, f);
+  const mode = modeOf.get(f) || '100644';
+  // 删除检测必须先于读取：工作区里已不存在但索引仍收录的文件，用 null sha 从 tree 中移除。
+  // 顺序反了会在 fs.readFileSync 抛 ENOENT，删文件场景直接崩，这段分支永远走不到。
+  if (!fs.existsSync(abs)) { entries[k] = { path: f, mode, type: 'blob', sha: null }; return; }
+  const content = fs.readFileSync(abs);
   const blob = await api(`/repos/${repo}/git/blobs`, {
     method: 'POST',
     body: JSON.stringify({ content: content.toString('base64'), encoding: 'base64' }),
   });
-  entries[k] = { path: f, mode: '100644', type: 'blob', sha: blob.sha };
+  entries[k] = { path: f, mode, type: 'blob', sha: blob.sha };
   process.stdout.write('.');
 });
 console.log('\nblob 完成');
