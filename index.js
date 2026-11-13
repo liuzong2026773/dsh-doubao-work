@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export const name = 'dsh-doubao-work';
-export const inject = ['llm', 'webServer'];
+export const inject = ['llm'];
 
 // ---------------- 配置面板 ----------------
 
@@ -209,7 +209,9 @@ export function apply(ctx, config) {
   // GET  /doubao/status  → 账号池 + 今日用量 + 会话数
   // POST /doubao/check   → 逐个账号做健康检查
   try {
-    const web = ctx.webServer;
+    // 不硬依赖 webServer：该服务在部分启动阶段可能未 ready，硬依赖会让插件一直 pending。
+    // ctx.get 是 cordis 提供的"不声明 inject 也能读服务"的出口，拿不到就降级。
+    const web = typeof ctx.get === 'function' ? ctx.get('webServer') : undefined;
     if (web?.register) {
       web.register({
         kind: 'exact',
