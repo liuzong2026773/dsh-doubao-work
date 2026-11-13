@@ -171,6 +171,19 @@ const server = http.createServer((req, res) => {
       return;
     }
 
+    if (mode === 'fileblock') {
+      // 文件直链块（10020）：Word/PDF 这类在 SSE 里就能拿到，不必等会话消息
+      sse(res, 'STREAM_CHUNK', { patch_op: [{ patch_object: 1, patch_value: { content_block: [{ block_type: 10020, content: { file_block: {
+        type: 'docx', name: '周报.docx', uri: 'tos-cn-i-x/z.docx', url: 'https://x.test/z.docx?sig=1', size: '40267',
+      } } } ] } } ] } );
+      for (const t of ['已', '生', '成', '。']) {
+        sse(res, 'STREAM_CHUNK', { patch_op: [{ patch_object: 1, patch_value: { content_block: [{ content: { text_block: { text: t } } }] } }] });
+      }
+      sse(res, 'SSE_REPLY_END', { end_type: 3 });
+      res.end();
+      return;
+    }
+
     if (mode === 'media') {
       // 真实生图下发顺序：占位创作块（没有 URL）→ 文本 → 同一个 id 补上 image_ori URL
       const blk = (creations) => ({ patch_op: [{ patch_object: 1, patch_value: { content_block: [{ block_type: 2074, content: { creation_block: { creations } } }] } }] });
@@ -601,6 +614,57 @@ await ok('registerImages：补 pre_handle 登记（带 local_message_id），拿
   assert.equal(sent.uplink_entity.entity_content.image.key, 'tos-cn-i-a9rns2rl98/x.png');
   assert.ok(sent.local_message_id, '少了这个上游会 400 missing required parameter');
   assert.equal(sent.uplink_entity.identifier, reg[0].identifier, 'identifier 要和消息体里的一致');
+});
+
+await ok('collectMedia：轮询会话直到出现想要的产出（视频）', async () => {
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.collectMedia({ id: 'a1', cookie: COOKIE_A }, 'conv-test-1', { kind: 'video', everyMs: 100, maxMs: 3000 });
+  assert.equal(r.pending, false, 'mock 会话里有视频，不该 pending');
+  assert.ok(r.media.some(m => m.kind === 'video'), JSON.stringify(r.media).slice(0, 120));
+  assert.ok(r.polls >= 1, '应至少轮询一次');
+});
+
+await ok('collectMedia：要的类型没有就如实 pending（别把视频当文件返回）', async () => {
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.collectMedia({ id: 'a1', cookie: COOKIE_A }, 'conv-test-1', { kind: 'file', everyMs: 100, maxMs: 400 });
+  assert.equal(r.pending, true);
+  assert.equal(r.media.filter(m => m.kind === 'file').length, 0);
+});
+
+await ok('collectMedia：没有会话号时不空转', async () => {
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.collectMedia({ id: 'a1', cookie: COOKIE_A }, '', { maxMs: 5000 });
+  assert.equal(r.polls, 0);
+  assert.equal(r.media.length, 0);
+});
+
+await ok('10020 file_block：Word/PDF 这类文件解析成带直链的可下载条目', async () => {
+  const { pickBlocksMedia } = await import('../doubao.js');
+  const media = pickBlocksMedia([{
+    block_type: 10020,
+    content: { file_block: {
+      type: 'docx', name: '项目周报.docx',
+      uri: 'tos-cn-i-x/y.docx',
+      url: 'https://x.test/y.docx?sig=1\\u0026e=2',
+      size: '40267',
+    } },
+  }], new Set());
+  assert.equal(media.length, 1);
+  assert.equal(media[0].kind, 'file');
+  assert.equal(media[0].url, 'https://x.test/y.docx?sig=1&e=2', '应还原 & 转义');
+  assert.equal(media[0].direct, true, '带 url 的应标成可直下');
+  assert.equal(media[0].name, '项目周报.docx');
+  assert.equal(media[0].size, 40267);
+});
+
+await ok('generate()：文件在 SSE 里以 10020 到达时直接产出可下载条目', async () => {
+  upstream.defaultBehavior = 'fileblock';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.generate('做个 Word 周报', { id: 'a1' });
+  const f = r.media.find(m => m.kind === 'file');
+  assert.ok(f, '应解析出文件：' + JSON.stringify(r.media));
+  assert.equal(f.direct, true);
+  assert.ok(/\.docx/.test(f.url), f.url);
 });
 
 server.close();

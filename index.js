@@ -90,7 +90,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.6.0';
+export const VERSION = '1.6.1';
 
 /**
  * 配置默认值。
@@ -1007,7 +1007,16 @@ export function apply(ctx, rawConfig) {
             const r = isVideo
               ? await client.generateVideo(prompt, { id: typeof body.id === 'string' ? body.id : '', conversationId: convId, pollMs: Number(body.pollMs) || 0, maxWaitMs: Number(body.maxWaitMs) || 0, timeoutMs: Number(body.timeoutMs) || 0, forceConfirm: body.forceConfirm === true, images })
               : await client.generate(prompt, { id: typeof body.id === 'string' ? body.id : '', conversationId: convId, timeoutMs: Number(body.timeoutMs) || 0, images });
-            const media = r.media || [];
+            let media = r.media || [];
+            // 文件卡片（PPT/Word/表格）常常在 SSE 结束之后就落到会话里了——补一轮回收
+            if (!media.length && !r.pending && r.conversationId && (kind === 'file' || kind === 'any')) {
+              const got = await client.collectMedia(client._pickAccount(typeof body.id === 'string' ? body.id : ''), r.conversationId, {
+                kind: kind === 'any' ? '' : kind,
+                everyMs: Number(body.pollMs) || 8000,
+                maxMs: Number(body.maxWaitMs) || 120000,
+              });
+              if (got.media && got.media.length) { media = got.media; r.polls = got.polls; r.pending = !got.media.length; }
+            }
             const wanted = media.filter(m => kind === 'any' || m.kind === kind);
             json(res, 200, {
               ok: true,
@@ -1023,7 +1032,9 @@ export function apply(ctx, rawConfig) {
               hint: r.pending
                 ? '视频还在生成：豆包是"生成好后自己发消息"，稍后带同一个 conversationId 再调一次就能取到 mp4'
                 : (wanted.length
-                  ? '已拿到产出（图片/视频直链有时效，尽快下载；文件在豆包云端，点链接进对话下载）'
+                  ? (wanted.some(m => m.kind === 'file' && m.direct)
+                  ? '已拿到产出：文件带直链可直接下载（链接有时效，尽快存）'
+                  : '已拿到产出（图片/视频直链有时效，尽快下载；PPT 这类产物在豆包云端，点链接进对话下载）')
                   : (/确认|参数确认/.test(r.text || '') && kind === 'video'
                     ? '豆包先给了参数确认：把 conversationId 带上再发一句「确认，开始生成」才会真出片'
                     : '上游没给媒体，只回了文字：可能额度不足、或它认为这是个纯文本任务')),

@@ -1056,4 +1056,17 @@ ok('uploadImagesForRequest：客户端不在调试端口时给出原因 + 提醒
   assert.equal(r.images.length, 0);
   assert.ok(/没能传给豆包/.test(r.note), '应有提示：' + r.note);
 });
+ok('pickBlocksMedia：直链文件（10020）与产物卡片（10030）两类都认', async () => {
+  const { pickBlocksMedia } = await import('../doubao.js');
+  const seen = new Set();
+  const a = pickBlocksMedia([{ block_type: 10020, content: { file_block: {
+    name: 'a.docx', url: 'https://x.test/a.docx', type: 'docx', size: '1',
+  } } }], seen);
+  const b = pickBlocksMedia([{ block_type: 10030, content: { artifact_block: {
+    resource_id: 'r1', conversation_id: 'c1', title: 'PPT', status: 2,
+  } } }], seen);
+  assert.equal(a[0].direct, true, '10020 有 url，应 direct');
+  assert.ok(b[0].url.includes('/chat/c1'), '10030 没有直链，给打开对话的入口');
+});
+
 console.log('\n全部通过：' + passed + ' 项');

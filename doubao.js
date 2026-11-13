@@ -85,6 +85,26 @@ export function pickBlocksMedia(blocks, seen = new Set()) {
       });
       continue;
     }
+    // 10020 = file_block：Word / PDF / 表格这类文件，带签名直链，可以直接下载（实测 40KB docx）
+    if (bt === 10020) {
+      const f = (b.content && b.content.file_block) || {};
+      const url = String(f.url || '').replace(/\\u0026/g, '&');
+      if (!url) continue;
+      const key = 'file|' + String(f.uri || url) + '|' + String(f.name || '');
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        kind: 'file',
+        url,
+        name: String(f.name || '文件'),
+        fileType: String(f.type || ''),
+        size: Number(f.size) || 0,
+        uri: String(f.uri || ''),
+        direct: true,
+      });
+      continue;
+    }
+
     if (bt !== 2074) continue;
     const creations = (b.content && b.content.creation_block && b.content.creation_block.creations) || [];
     for (const cr of creations) {
@@ -987,26 +1007,14 @@ export class DoubaoClient {
     }
 
     // 第 3 步：轮询会话，等视频消息出现
-    const everyMs = Number(options.pollMs) || 15000;
-    const maxMs = Number(options.maxWaitMs) || 8 * 60 * 1000;
-    const started = Date.now();
-    let polls = 0;
-    while (Date.now() - started < maxMs) {
-      polls++;
-      await new Promise(r => setTimeout(r, polls === 1 ? Math.min(everyMs, 5000) : everyMs));
-      let found = [];
-      try {
-        found = await this.latestMedia(acc, convId);
-      } catch (e) {
-        log('warn', '轮询会话失败：' + e.message);
-      }
-      const video = found.find(m => m.kind === 'video');
-      if (video) {
-        return { text, media: found, conversationId: convId, account: acc.id, polls, pending: false };
-      }
-      log('info', `视频还在生成（第 ${polls} 次轮询，已等 ${Math.round((Date.now() - started) / 1000)}s）`);
-    }
-    return { text, media: [], conversationId: convId, account: acc.id, polls, pending: true };
+    const got = await this.collectMedia(acc, convId, {
+      kind: 'video',
+      everyMs: Number(options.pollMs) || 15000,
+      maxMs: Number(options.maxWaitMs) || 8 * 60 * 1000,
+    });
+    const video = (got.media || []).find(m => m.kind === 'video');
+    if (video) return { text, media: got.media, conversationId: convId, account: acc.id, polls: got.polls, pending: false };
+    return { text, media: got.media || [], conversationId: convId, account: acc.id, polls: got.polls, pending: true };
   }
 
   /**
@@ -1051,6 +1059,34 @@ export class DoubaoClient {
       out.push({ ...im, identifier, preGenerateId: (j.data && j.data.pre_generate_id) || '' });
     }
     return out;
+  }
+
+  /**
+   * 回收"事后才落库"的产出：文件卡片（10030）和视频（2074）都不在提交那次的 SSE 里，
+   * 而是在流结束后以普通消息写入会话。这里轮询会话消息，直到出现想要的东西。
+   * @returns {Promise<{media: Array, polls: number, pending: boolean}>}
+   */
+  async collectMedia(account, conversationId, opts = {}) {
+    const want = String(opts.kind || '');
+    const everyMs = Number(opts.everyMs) || 8000;
+    const maxMs = Number(opts.maxMs) || 60000;
+    const started = Date.now();
+    let polls = 0;
+    let last = [];
+    if (!account || !conversationId) return { media: [], polls, pending: false };
+    while (Date.now() - started < maxMs) {
+      await new Promise(r => setTimeout(r, polls === 0 ? Math.min(everyMs, 4000) : everyMs));
+      polls++;
+      try {
+        last = await this.latestMedia(account, conversationId);
+      } catch (e) {
+        this.log && this.log('warn', '回收产出时拉会话失败：' + e.message);
+        continue;
+      }
+      const hit = want ? last.filter(m => m.kind === want) : last;
+      if (hit.length) return { media: last, polls, pending: false };
+    }
+    return { media: last, polls, pending: true };
   }
 
   /** 把路径拼成上游 URL（沿用当前身份：客户端 / 网页） */
@@ -1141,6 +1177,8 @@ export class DoubaoClient {
         sink.media.push(m);
         if (m.kind === 'image') yield push('\n\n![](' + m.url + ')\n\n');
         else if (m.kind === 'video') yield push('\n\n[视频](' + m.url + ')\n\n');
+        // 直链文件（10020）点开就是下载；产物卡片（10030）只能进对话再点
+        else if (m.direct) yield push('\n\n📄 [' + (m.name || '文件') + '](' + m.url + ')\n\n> 直链有时效，尽快下载（' + (m.size ? Math.round(m.size / 1024) + 'KB' : '已生成') + '）\n\n');
         else yield push('\n\n📄 [' + (m.name || '文件') + '](' + m.url + ')\n\n> 文件存在豆包云端，打开链接后点卡片右下角「下载/导出」即可保存\n\n');
       }
     };

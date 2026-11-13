@@ -42,6 +42,18 @@ const r = kind === 'video'
   ? await client.generateVideo(prompt, { id: opt('id'), maxWaitMs: Number(opt('max-wait', '0')) || 420000, pollMs: Number(opt('poll', '0')) || 15000 })
   : await client.generate(prompt, { id: opt('id') });
 console.log(`\n用时 ${((Date.now() - started) / 1000).toFixed(1)}s｜账号 ${r.account}`);
+console.log('会话:', r.conversationId || '(无)');
+// 文件类产出在流结束后才落进会话：没拿到就再等一会儿
+if (!r.media.length && r.conversationId && kind !== 'video') {
+  console.log('本轮 SSE 没有产出，回收会话消息中（最多 ' + (Number(opt('wait', '120000')) / 1000) + 's）…');
+  const got = await client.collectMedia(client._pickAccount(opt('id')), r.conversationId, {
+    kind: kind === 'any' ? '' : kind,
+    everyMs: 8000,
+    maxMs: Number(opt('wait', '120000')) || 120000,
+  });
+  if (got.media.length) console.log('回收成功（第 ' + got.polls + ' 次）');
+  r.media = got.media;
+}
 console.log('文本：' + (r.text || '（空）').slice(0, 400));
 const picked = r.media.filter(m => kind === 'any' || m.kind === kind);
 if (!r.media.length) console.log('\n媒体：无（上游只回了文字——可能额度不足、或它判断这不该生成）');

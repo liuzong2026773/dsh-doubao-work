@@ -136,7 +136,7 @@ Application 包装层的布局也认）。想用别的内核浏览器，在插�
   （见「运维小工具」）
 - **图片输入（1.6.0）**：DSH 会话里发图 → 豆包真的看图回答（适配器自动上传 + 登记，实测"蓝色，横向长方形"）
 - **生图 / 生视频 / 出文件（1.6.0）**：面板「创作」区一键生成；生图回图片直链（markdown 内嵌显示），
-  生视频等出片后回 mp4 直链，PPT/Word/PDF/表格给打开链接；命令行 `tools/generate.mjs` 同能力
+  生视频等出片后回 mp4 直链，Word/PDF/表格回**签名直链**可直接下载，PPT 回对话入口；命令行 `tools/generate.mjs` 同能力
 - **客户端身份（1.6.0）**：带 msToken 时请求整体切到豆包 PC 客户端身份（`aid=582478` + 客户端 UA +
   `chrome://doubao-chat/` Referer），实测网页身份被 710022004 风控拦死时客户端身份畅通
 - **msToken 自动摘取（1.6.0）**：面板「抓取 msToken」/ `tools/mstoken.mjs --harvest`，从豆包客户端的
@@ -225,11 +225,18 @@ msToken 是从客户端请求里**被动摘**的（`tools/mstoken.mjs --harvest`
 `video.download_url`（实测 1–3 分钟，mp4 约 1.3MB）。拿不到时返回 `pending:true`，
 稍后带同一个 `conversationId` 再调即可取回。
 
-**④ 文件产出（PPT / Word / PDF / 表格）**：完成后以 `block_type 10030` 产物卡片到达，只有
-`resource_id + conversation_id + title`，**没有直链**（文件在豆包云盘/飞书文档里）。插件给
-「打开这条对话」的链接当下载入口，进去点卡片下载。直连导出接口
-（`/samantha/otter/export/page/create`）试了十余种参数组合都是 `record not found`/`params invalid`，
-该 token 只存在于云盘页面自己的会话里——如实标注为未攻克，见「待办」。
+**④ 文件产出（Word / PDF / 表格 / PPT）**：两种形状都认：
+
+| 形状 | 块 | 内容 | 能不能直接下 |
+| --- | --- | --- | --- |
+| `file_block` | `10020` | `{type,name,uri,url,size}`，`url` 是**签名直链** | ✅ 直接下载 |
+| `artifact_block` | `10030` | 只有 `resource_id + conversation_id + title`（PPT 走这个） | ❌ 给"打开对话"入口 |
+
+实测：Word 周报 113s 生成 → 回收直链 → 下载 HTTP 200、39KB、magic `PK`（合法 docx）。
+文档类和视频一样，产出常在 **SSE 结束之后**才写进会话消息，所以 `generate()` 没拿到媒体时会自动
+再轮询一轮（`collectMedia`，面板与 `tools/generate.mjs --kind file` 都走这套）。
+PPT 走 `10030`：直连导出接口 `/samantha/otter/export/page/create` 试了十余组参数都是
+`record not found`/`params invalid`（导出 token 只存在于云盘页面自己的会话里），**未攻克，如实标注**。
 
 **接口与工具**：
 
@@ -257,7 +264,8 @@ curl -X POST http://127.0.0.1:<port>/doubao/mstoken -d '{"action":"harvest"}'
 - **图片输入依赖豆包客户端开着**（借它的 file input 上传）。客户端不开时会在回复里明确说
   "有几张图没传过去"，不会假装看过图
 - **msToken 会过期**（跟登录态同寿命）。过期后表现为风控变严，面板点一次「抓取 msToken」即可续
-- **文件产出没有直链**：PPT/Word/PDF/表格给的是"打开对话"的入口，下载要点豆包里的卡片
+- **只有 PPT 没有直链**：Word/PDF/表格（`10020`）给签名直链可直接下载；PPT 走产物卡片（`10030`），
+  只能给"打开对话"的入口，下载要点豆包里的卡片
 - **生视频要等**：提交后 1–3 分钟出片，插件默认最多轮询 8 分钟（`maxWaitMs` 可调），
   超时不代表失败，带 `conversationId` 再查一次就能取回
 - 生图/生视频的直链是带签名的临时地址（几小时到几天），要留存就尽快下载
@@ -464,8 +472,8 @@ curl -X POST http://<host>:<port>/doubao/account/add \
 两套离线测试都不联网、不消耗豆包额度：
 
 ```bash
-node tests/smoke.mjs      # 插件契约 + HTTP 管理接口 + 适配器流协议（122 项）
-node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致，33 项）
+node tests/smoke.mjs      # 插件契约 + HTTP 管理接口 + 适配器流协议（123 项）
+node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致，38 项）
 ```
 
 1.6.0 新增覆盖：带图消息体（10052 附件块 + pre_handle 登记）、图片占位块去重、产物卡片 10030 解析、
@@ -498,6 +506,17 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致，33 
 
 ## 更新记录
 
+- **1.6.1**（2026-11-14，文件直链 + 产出回收）：
+  - **Word/PDF/表格能直接下载了**：这类文件是 `block_type 10020`（`file_block`），自带签名直链；
+    实测 Word 周报 113s 生成 → 回收 → 下载 HTTP 200、39KB、magic `PK`（合法 docx）。
+    PPT 仍是 `10030` 产物卡片（无直链，给对话入口）。
+  - **新增 `collectMedia()`**：视频/文档的产出常在 SSE 结束之后才写进会话消息，统一轮询
+    `latest_messagelist` 回收；`generate()`、`/doubao/generate`、`tools/generate.mjs` 都接上了。
+  - **修掉生成长任务被掐断**：`_withTimeout(signal, extraMs)` 支持按次放宽，
+    之前 PPT 跑到 182s 会被内部 180s 超时中断（`aborted`），现已放宽到 10 分钟。
+  - 回复里的文件行按类型给不同提示：直链标"尽快下载（39KB）"，产物卡片标"进对话点卡片下载"。
+  - 测试：`smoke` **123 项**、`upstream` **38 项**。
+
 - **1.6.0**（2026-11-14，多模态与创作产出）：
   - **图片输入真的通了**：DSH 发图 → 借豆包客户端的 file input 上传到 imagex → 调
     `/alice/message/pre_handle_v2_without_conv` 登记 → 消息体带 `attachment_block`（10052）。
@@ -520,8 +539,12 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致，33 
   - **面板新增**：「创作」区（选生图/生视频/出文件 + 一句话 → 结果直接显示）+ 「抓取 msToken」/「看身份」。
   - **新接口**：`/doubao/generate`、`/doubao/image/upload`、`/doubao/mstoken`；
     新工具 `tools/generate.mjs`、`tools/mstoken.mjs`；新模块 `uploader.js`、`mstoken.js`。
-  - 测试：`smoke` 119 → **122 项**、`upstream` 27 → **33 项**，新增带图消息体、pre_handle 登记、
-    视频轮询、产物卡片、上传失败提示等用例。
+  - **文件产出比预期好**：Word/PDF/表格走 `block_type 10020`（`file_block`），带**签名直链**，
+    实测下载 39KB docx、magic `PK`；PPT 走 `10030` 产物卡片，没有直链，仍只能给对话入口。
+  - **产出常在 SSE 结束后才落库**：新增 `collectMedia()` 回收器（视频/文档共用），
+    默认再等 1–2 分钟，超时如实 `pending`。同时修掉"生成到 182s 被内部 180s 超时掐断"的老问题。
+  - 测试：`smoke` 119 → **123 项**、`upstream` 27 → **38 项**，新增带图消息体、pre_handle 登记、
+    视频轮询、10020/10030 两类文件块、collectMedia、上传失败提示等用例。
 - **1.5.3**（2026-11-14，签到活动下线的实证 + 抓包工具）：
   - **签到为什么一直失败，终于有服务端原话了**：接进电脑版豆包自带的 webview 后抓到
     `POST /alice/ug/campaign/v3/detail/ {"campaign_group_code":"pc_incentive_task_mvp_v3"}`
