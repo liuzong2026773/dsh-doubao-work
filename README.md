@@ -85,10 +85,14 @@
 
 ```
 dsh-doubao-work/
-├── index.js           # 插件主体：注册 LlmAdapter
-├── doubao.js          # 上游内核：Cookie 直连 / SSE 解析 / 账号池 / 冷却
+├── index.js           # 插件主体：注册 LlmAdapter + 状态/管理接口
+├── doubao.js          # 上游内核：Cookie 直连 / SSE 解析 / 账号池 / 冷却 / 会话复用
+├── client.js          # 浏览器半身：设置页「豆包工作」
 ├── package.json
-└── cordis.patch.yml
+├── cordis.patch.yml
+├── tests/             # smoke.mjs（契约/接口）、upstream.mjs（本地假上游）
+├── tools/             # status / accounts / panel / git-api-push
+└── standalone/        # 同内核的 OpenAI 兼容网关（独立进程）
 ```
 
 ## 附：standalone 网关
@@ -139,6 +143,19 @@ node tools/accounts.mjs add --id acc-2 --remark 小号 --cookie-file /tmp/c.txt
 node tools/accounts.mjs disable --id acc-2
 node tools/accounts.mjs export --out /tmp/backup.json
 ```
+
+## 推送代码（国内网络备选）
+
+直连 `github.com` 时常见 `Recv failure: Connection was reset`（`api.github.com` 往往还是通的）。
+此时可以照常 `git add` / `git commit`，再用 API 推送：
+
+```bash
+GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs            # 自动从 origin 推断仓库
+GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work main
+```
+
+只提交 `git ls-files` 里的文件（`accounts.json`、`gateway-state.json` 被 `.gitignore` 挡住，不会上传），
+提交信息取当前 HEAD 的那条。令牌用环境变量传，别写进 URL。
 
 ## 状态接口（插件内，需重启 DSH 后生效）
 
