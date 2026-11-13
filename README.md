@@ -110,8 +110,8 @@ dsh-doubao-work/
 离线自检（不重启、不联网、不耗额度）：
 
 ```bash
-node tests/smoke.mjs      # 契约/路由/账号管理/错误码/流协议，共 40 项
-node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用，共 11 项
+node tests/smoke.mjs      # 契约/路由/账号管理/签到/错误码/复用规划/流协议，共 57 项
+node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到，共 17 项
 ```
 
 数据来自宿主同源接口（双前缀，`/api/doubao/*` 与 `/doubao/*` 等价）：
@@ -219,10 +219,19 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 - `standalone/` 独立网关是**同逻辑的另一份实现**，1.2.2 已同步流中断保护（截断时 `finish_reason: length`
   并记 warn），但**仍不支持 function calling**。后续应改为直接复用 `doubao.js`，避免两处漂移。
 - 8 个未抓 `model_item_key`（豆包 2.1 Pro / Kimi K3 / GLM 5.3 等），抓到即可加进 `extraModels`。
-- 签到接口在网页端不存在（详见 docs），插件侧只能做额度记账与提醒，无法自动签到。
+- 签到接口 1.2.3 已抓到并接入（`/alice/ug/campaign/v3/detail/` 查状态 + `/alice/ug/campaign/landing/checkin` 执行，
+  详见 docs 与 `/doubao/checkin`）。待办：面板上的「一键签到」按钮接线，以及把每日签到做成定时任务。
 
 ## 更新记录
 
+- **1.2.4**（2026-11-13）：
+  - **复用起点改为尾部锚定（P1）**：`planReuse()` 原先按 `e.msgCount` 下标切片，而宿主会在**头部**重注入
+    system/上下文块，下标整体右移——于是起点落在旧的 user 消息上，把上游已有的消息再发一遍
+    （表现为同一轮上下文重复出现）。现在只要上一条 assistant 的哈希与上次返回一致，就直接取 `len - 1`，
+    与下标漂移无关；一次追加多条而取不到上轮回复时，才退回按下标定位并跳过 assistant。
+  - **测试恢复可用（P1）**：1.2.2 收紧回环守卫、1.2.3 加了两条签到路由之后，`tests/smoke.mjs` 其实一直全红
+    （断言写死 7 条路由；mock 请求没带 `socket`，被守卫一律判 403；适配器桩没有 `planReuse`）。
+    现改为断言路由集合、mock 带上回环 `socket`、补齐桩，并新增 planReuse 8 项、签到接口契约 8 项、上游签到 6 项。
 - **1.2.3**（2026-11-13）：
   - **每轮都开新会话（P1，已修）**：`reusableConversation()` 要求历史条数**严格 +1** 才复用上游会话，而宿主每轮
     会重排消息、重注入 system/上下文块，条数几乎总在跳变，于是每一轮都整段重发、上游每次新建会话——表现就是

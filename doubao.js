@@ -505,8 +505,12 @@ export class DoubaoClient {
     const len = Array.isArray(msgs) ? msgs.length : 0;
     // 条数回退说明历史被截断/压缩，复用上游会话会缺内容，宁可整段重发
     if (!len || len <= e.msgCount) return null;
-    // 上一轮只发到 user 为止，其后的 assistant 是上游生成的；本轮必须从这条回复之后开始，
-    // 否则会把自己的回复当用户输入再发一遍
+    // 尾部锚定：上一条 assistant 已确认就是上次上游返回的回复，说明它之前的内容上游都有，
+    // 本轮只需发最后一条新消息。这里不看 e.msgCount——宿主常在最前面重注入 system/上下文块，
+    // 下标会整体右移，按下标切会把已经发过的消息再发一遍（用户看到重复上下文）。
+    if (lastReplyText) return { conversationId: e.conversationId, fromIndex: len - 1 };
+    // 取不到上一轮回复（倒数第二条不是 assistant，比如一次追加多条）：退回按下标定位，
+    // 并跳过其中的 assistant，避免把自己的回复当用户输入再发一遍
     let from = Math.min(e.msgCount, len - 1);
     while (from < len - 1 && msgs[from]?.role === 'assistant') from += 1;
     if (from >= len) return null;

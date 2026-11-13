@@ -21,7 +21,15 @@ const upstream = {
   defaultBehavior: 'ok',
   bodies: [],
   hits: [],
+  // 活动/签到接口可控项
+  campaign: { checkedIn: false, detailCode: 0, detailHttp: 200, checkinCode: 0 },
 };
+
+/** 重置签到可控项 */
+function resetCampaign(over = {}) {
+  upstream.campaign = { checkedIn: false, detailCode: 0, detailHttp: 200, checkinCode: 0, ...over };
+}
+const campaignHits = () => upstream.hits.filter(p => p.startsWith('/alice/ug/campaign'));
 
 function sse(res, event, data) {
   res.write(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
@@ -36,6 +44,22 @@ const server = http.createServer((req, res) => {
   if (url.pathname === '/alice/commerce/sale/subscription/quota/summary/') {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ code: 0, data: {} }));
+    return;
+  }
+  if (url.pathname === '/alice/ug/campaign/v3/detail/') {
+    const c = upstream.campaign;
+    res.writeHead(c.detailHttp, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(c.detailCode === 0
+      ? { code: 0, data: { tasks: [{ daily_checkin: { checked_in_today: c.checkedIn, reward: '200 额度' } }] } }
+      : { code: c.detailCode, message: 'detail 异常' }));
+    return;
+  }
+  if (url.pathname === '/alice/ug/campaign/landing/checkin') {
+    const c = upstream.campaign;
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify(c.checkinCode === 0
+      ? { code: 0, data: { complete_page_info: { title: '签到成功' }, toast: { text: '+200 额度' } } }
+      : { code: c.checkinCode, message: '不满足签到条件' }));
     return;
   }
   if (url.pathname !== '/chat/completion') {
@@ -236,6 +260,66 @@ await ok('健康检查走 quota/summary 且 code:0 判活', async () => {
   const results = await c.checkAll();
   assert.equal(results.length, 1);
   assert.equal(results[0].ok, true);
+});
+
+console.log('每日签到');
+await ok('未签状态：先查状态再签到，返回 ok 与奖励', async () => {
+  upstream.byCookie = {};
+  resetCampaign({ checkedIn: false });
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const before = upstream.hits.length;
+  const r = await c.checkin(acc('a1', COOKIE_A));
+  assert.equal(r.result, 'ok');
+  assert.equal(r.reward, '200 额度');
+  const hits = upstream.hits.slice(before);
+  assert.deepEqual(hits, ['/alice/ug/campaign/v3/detail/', '/alice/ug/campaign/landing/checkin']);
+});
+
+await ok('当日已签：判 already 且不打 checkin 接口', async () => {
+  resetCampaign({ checkedIn: true });
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const before = campaignHits().length;
+  const r = await c.checkin(acc('a1', COOKIE_A));
+  assert.equal(r.result, 'already');
+  assert.deepEqual(campaignHits().slice(before), ['/alice/ug/campaign/v3/detail/'], '已签不应再打签到接口');
+});
+
+await ok('服务端硬拒：记 failed，同日不再重打', async () => {
+  resetCampaign({ checkedIn: false, checkinCode: 710010702 });
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const before = campaignHits().length;
+  const first = await c.checkin(acc('a1', COOKIE_A));
+  assert.equal(first.result, 'failed');
+  assert.equal(first.code, 710010702);
+  assert.equal(campaignHits().slice(before).filter(p => p.endsWith('/landing/checkin')).length, 1);
+  const again = await c.checkin(acc('a1', COOKIE_A));
+  assert.equal(again.result, 'skipped');
+  assert.equal(campaignHits().slice(before).filter(p => p.endsWith('/landing/checkin')).length, 1, '今日已失败，不应再打');
+});
+
+await ok('状态接口异常：checkin 抛出 upstream 错误', async () => {
+  resetCampaign({ detailCode: 710010202 });
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  await assert.rejects(c.checkin(acc('a1', COOKIE_A)), (e) => e instanceof DoubaoError && e.kind === 'upstream');
+});
+
+await ok('登录态失效：标 authError 并在汇总里记 error', async () => {
+  resetCampaign({ detailHttp: 401, detailCode: 401 });
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const results = await c.checkinAll();
+  assert.equal(results.length, 1);
+  assert.equal(results[0].result, 'error');
+  assert.equal(c.accountState('a1').authError, true);
+});
+
+await ok('多账号汇总：单号失败不影响其他号', async () => {
+  resetCampaign();
+  upstream.byCookie = {};
+  const c = makeClient([acc('a1', COOKIE_A), acc('a2', COOKIE_B)]);
+  const spy = c.checkin.bind(c);
+  c.checkin = async (a) => (a.id === 'a1' ? Promise.reject(new DoubaoError('network', '模拟网络故障')) : spy(a));
+  const results = await c.checkinAll();
+  assert.deepEqual(results.map(r => r.result).sort(), ['error', 'ok']);
 });
 
 server.close();

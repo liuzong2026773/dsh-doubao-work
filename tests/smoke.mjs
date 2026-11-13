@@ -37,11 +37,35 @@ const ctx = {
 console.log('加载与注册');
 ok('apply 不抛异常', () => mod.apply(ctx, { providerId: 'doubao-work', providerName: '测试', accounts: [] }));
 ok('注册了 provider', () => assert.deepEqual(adapterProviders, ['doubao-work']));
-ok('注册了 7 条路由（6 精确 + 1 /api 前缀）', () => assert.equal(Object.keys(routes).length, 7));
+ok('注册了预期路由集合（8 精确 + 1 /api 前缀）', () => {
+  assert.deepEqual(Object.keys(routes).sort(), [
+    '/api/doubao',
+    '/doubao/account/add',
+    '/doubao/account/enable',
+    '/doubao/account/remove',
+    '/doubao/account/update',
+    '/doubao/check',
+    '/doubao/checkin',
+    '/doubao/checkin/status',
+    '/doubao/status',
+  ].sort());
+});
 ok('拿不到 webServer 时降级不崩', () => {
   const noop = { llm: { registerAdapter() {} }, get: () => undefined };
   mod.apply(noop, { providerId: 'doubao-work', accounts: [] });
 });
+
+/** 与宿主一致的派发：精确优先，否则取最长前缀 */
+function findRoute(path) {
+  const exact = routes[path];
+  if (exact && exact.kind === 'exact') return exact;
+  let best;
+  for (const r of Object.values(routes)) {
+    if (r.kind !== 'prefix') continue;
+    if ((path === r.path || path.startsWith(r.path + '/')) && (!best || r.path.length > best.path.length)) best = r;
+  }
+  return best || exact;
+}
 
 function call(path, body, opts = {}) {
   return new Promise((resolve) => {
@@ -53,7 +77,11 @@ function call(path, body, opts = {}) {
     const req = new EventEmitter();
     req.url = path;
     req.headers = { host: '127.0.0.1:56854', ...(opts.headers || {}) };
-    const p = routes[path].handler(req, res);
+    // 1.2.2 起管理接口要求「同源或本机回环」，mock 必须带上 socket，否则一律 403
+    req.socket = { remoteAddress: opts.remoteAddress || '127.0.0.1' };
+    const route = findRoute(path);
+    if (!route) return resolve({ code: 404, body: 'NO ROUTE ' + path });
+    const p = route.handler(req, res);
     if (body !== undefined) req.emit('data', typeof body === 'string' ? body : JSON.stringify(body));
     req.emit('end');
     if (p && p.catch) p.catch(e => resolve({ code: 500, body: 'ERR ' + e.message }));
@@ -106,6 +134,100 @@ ok('contextReuse=false 时永不复用', () => {
   c.rememberConversation('k', 'cid', 1);
   assert.equal(c.reusableConversation('k', 2), null);
 });
+
+console.log('会话复用规划 planReuse（1.2.3 的 P1：宿主重排消息后仍要复用）');
+const mkMsg = (role, text) => ({ role, content: [{ type: 'text', text }] });
+const textOf = (m) => (m.content || []).map(b => b.text).join('');
+ok('没记录过会话 → 不复用', () => {
+  const c = new gating.DoubaoClient({ accounts: [] }, {});
+  assert.equal(c.planReuse('k', [mkMsg('user', '一')], ''), null);
+});
+ok('只补发上一轮回复之后的新消息（不把自己的回复当用户输入重发）', () => {
+  const c = new gating.DoubaoClient({ accounts: [] }, {});
+  c.rememberConversation('k', 'cid', 3, '回复2'); // 上一轮输入 3 条，回复是「回复2」
+  const msgs = [mkMsg('user', '一'), mkMsg('assistant', '回复1'), mkMsg('user', '二'), mkMsg('assistant', '回复2'), mkMsg('user', '三')];
+  const plan = c.planReuse('k', msgs, '回复2');
+  assert.ok(plan, '条数增加应复用');
+  assert.equal(plan.conversationId, 'cid');
+  assert.deepEqual(msgs.slice(plan.fromIndex).map(x => x.role), ['user'], '尾部应只剩新那条 user');
+  assert.equal(textOf(msgs[plan.fromIndex]), '三');
+});
+ok('宿主在头部重注入上下文块（下标漂移）时，仍只发最新一条', () => {
+  const c = new gating.DoubaoClient({ accounts: [] }, {});
+  // 上一轮输入是 [system, u1, r1, u2] 共 4 条，回复「r2」
+  c.rememberConversation('k', 'cid', 4, 'r2');
+  // 本轮宿主又在最前面插了 system 与上下文块，整体下标右移
+  const msgs = [mkMsg('system', 'S'), mkMsg('user', 'ctx'), mkMsg('user', 'u1'), mkMsg('assistant', 'r1'),
+    mkMsg('user', 'u2'), mkMsg('assistant', 'r2'), mkMsg('user', 'u3')];
+  const plan = c.planReuse('k', msgs, 'r2');
+  assert.ok(plan, '回复哈希一致，应复用');
+  assert.deepEqual(msgs.slice(plan.fromIndex).map(m => textOf(m)), ['u3'],
+    '不能把 u2 / r2 再发一遍（上游会话里已经有了）');
+});
+ok('本轮新增多条消息时，从上一条回复之后整体补发', () => {
+  const c = new gating.DoubaoClient({ accounts: [] }, {});
+  c.rememberConversation('k', 'cid', 1, 'r1');
+  const msgs = [mkMsg('user', 'u1'), mkMsg('assistant', 'r1'), mkMsg('user', 'u2'), mkMsg('user', 'u3')];
+  const plan = c.planReuse('k', msgs, ''); // 倒数第二条不是 assistant，取不到上一轮回复
+  assert.ok(plan);
+  assert.deepEqual(msgs.slice(plan.fromIndex).map(m => textOf(m)), ['u2', 'u3'], 'r1 不应被重发');
+});
+ok('宿主重排导致条数跳变（+2 / +5）依然复用', () => {
+  const c = new gating.DoubaoClient({ accounts: [] }, {});
+  for (const extra of [2, 5]) {
+    c.rememberConversation('k', 'cid', 2, '回复1');
+    const msgs = [mkMsg('user', '一'), mkMsg('assistant', '回复1')];
+    for (let i = 0; i < extra; i++) msgs.push(mkMsg('user', '补' + i));
+    const plan = c.planReuse('k', msgs, '回复1');
+    assert.ok(plan, `条数跳变到 ${msgs.length} 时应复用`);
+    assert.equal(msgs.slice(plan.fromIndex).length, 1, '只发最后一条新消息');
+  }
+});
+ok('历史被压缩（条数回退）→ 不复用', () => {
+  const c = new gating.DoubaoClient({ accounts: [] }, {});
+  c.rememberConversation('k', 'cid', 6, '回复');
+  assert.equal(c.planReuse('k', [mkMsg('user', '一')], '回复'), null);
+});
+ok('上一轮回复被改写 → 不复用（防串会话）', () => {
+  const c = new gating.DoubaoClient({ accounts: [] }, {});
+  c.rememberConversation('k', 'cid', 2, '原回复');
+  const msgs = [mkMsg('user', '一'), mkMsg('assistant', '被改写过'), mkMsg('user', '二')];
+  assert.equal(c.planReuse('k', msgs, '被改写过'), null);
+});
+ok('超过 conversationTtlSec → 不复用并回收条目', () => {
+  const c = new gating.DoubaoClient({ accounts: [], conversationTtlSec: 60 }, {});
+  c.convMap.set('k', { conversationId: 'cid', msgCount: 1, ts: Date.now() - 3600_000, replyHash: '' });
+  assert.equal(c.planReuse('k', [mkMsg('user', '一'), mkMsg('user', '二')], ''), null);
+  assert.equal(c.convMap.has('k'), false, '过期条目应被回收');
+});
+ok('contextReuse=false → planReuse 永不复用', () => {
+  const c = new gating.DoubaoClient({ accounts: [], contextReuse: false }, {});
+  c.rememberConversation('k', 'cid', 1, '回复');
+  assert.equal(c.planReuse('k', [mkMsg('user', '一'), mkMsg('user', '二')], '回复'), null);
+});
+
+console.log('签到接口');
+const ciAll = await call('/doubao/checkin', {});
+ok('无账号时签到返回空汇总（200）', () => {
+  assert.equal(ciAll.code, 200);
+  const j = JSON.parse(ciAll.body);
+  assert.deepEqual(j.summary, { total: 0, ok: 0, already: 0, skipped: 0, failed: 0 });
+  assert.ok(Array.isArray(j.results));
+});
+const ciBadId = await call('/doubao/checkin', { id: 'a b' });
+ok('签到非法 id → 400', () => assert.equal(ciBadId.code, 400));
+const ciUnknown = await call('/doubao/checkin', { id: 'acc-none' });
+ok('签到未知账号 → 404', () => assert.equal(ciUnknown.code, 404));
+const ciNoBody = await call('/doubao/checkin', '{oops');
+ok('签到非法 JSON → 400（不 500）', () => assert.equal(ciNoBody.code, 400));
+const csNoId = await call('/doubao/checkin/status', {});
+ok('签到状态缺 id → 400', () => assert.equal(csNoId.code, 400));
+const csUnknown = await call('/doubao/checkin/status', { id: 'acc-none' });
+ok('签到状态未知账号 → 404', () => assert.equal(csUnknown.code, 404));
+const csCross = await call('/doubao/checkin/status', { id: 'acc-none' }, { headers: { origin: 'http://evil.example' } });
+ok('签到状态跨源 → 403', () => assert.equal(csCross.code, 403));
+const ciViaPrefix = await call('/api/doubao/checkin', {});
+ok('/api/doubao/checkin 前缀可达', () => assert.equal(ciViaPrefix.code, 200));
 
 console.log('账号管理接口');
 const COOKIE = 'sessionid=test1234567890abcdef; sid_guard=x; uid_tt=y';
@@ -185,7 +307,7 @@ ok('DoubaoError.kind 全覆盖且映射到宿主错误码', () => {
 for (const kind of Object.keys(expected)) {
   const adapter = makeAdapter({
     models: () => [{ id: 'm1', name: 'M1', modelItemKey: 'k' }],
-    reusableConversation: () => null,
+    planReuse: () => null,
     rememberConversation: () => {},
     async *chat() { const { DoubaoError } = gating; throw new DoubaoError(kind, 'x'); },
   });
@@ -200,7 +322,7 @@ for (const kind of Object.keys(expected)) {
 ok('流式：block-start/delta/block-end/usage/finish 顺序与字段', async () => {
   const adapter = makeAdapter({
     models: () => [{ id: 'm1', name: 'M1', modelItemKey: 'k' }],
-    reusableConversation: () => null,
+    planReuse: () => null,
     rememberConversation: () => {},
     async *chat() { yield '你'; yield '好'; return { text: '你好', conversationId: 'c1' }; },
   });
@@ -215,7 +337,7 @@ ok('流式：block-start/delta/block-end/usage/finish 顺序与字段', async ()
 ok('流中断：finish 为 max-tokens 而不是 stop', async () => {
   const adapter = makeAdapter({
     models: () => [{ id: 'm1', name: 'M1', modelItemKey: 'k' }],
-    reusableConversation: () => null,
+    planReuse: () => null,
     rememberConversation: () => {},
     async *chat() { yield '半'; return { text: '半', conversationId: 'c1', truncated: true }; },
   });
