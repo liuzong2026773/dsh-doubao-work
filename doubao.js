@@ -21,6 +21,17 @@ const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML,
 
 const uuid = () => crypto.randomUUID();
 
+// ---- 额度按「北京时间自然日」结算 ----
+const CN_OFFSET = 8 * 3600 * 1000;
+function cnDate(ts = Date.now()) { return new Date(ts + CN_OFFSET); }
+function dayKeyCN(ts = Date.now()) { return cnDate(ts).toISOString().slice(0, 10); }
+function isMondayCN(ts = Date.now()) { return cnDate(ts).getUTCDay() === 1; }
+function msUntilMidnightCN(ts = Date.now()) {
+  const t = cnDate(ts);
+  const next = Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate() + 1);
+  return Math.max(1000, next - t.getTime());
+}
+
 /** 带机器码的上游错误：kind ∈ auth | ratelimit | upstream | network | noaccount | empty | aborted */
 export class DoubaoError extends Error {
   constructor(kind, message, status) {
@@ -49,7 +60,10 @@ export class DoubaoClient {
     this.accountsPath = opts.accountsPath; // accounts.json 热加载（改文件即生效，无需重启）
     this.state = this._loadState();
     this.roundIndex = 0;
-    this.convMap = new Map(); // 对话键 → { conversationId, msgCount, ts }
+    // 对话键 → { conversationId, msgCount, ts }；从持久化状态恢复，重启不丢上下文
+    this.convMap = new Map(Object.entries(this.state.conversations || {}));
+    this.running = 0;   // 全局并发
+    this.queue = [];
     this._saveTimer = null;
     this._accountsFileMtime = 0;
     this._accountsFileAccounts = [];
@@ -59,9 +73,47 @@ export class DoubaoClient {
 
   _loadState() {
     try {
-      if (this.statePath && fs.existsSync(this.statePath)) return JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
+      if (this.statePath && fs.existsSync(this.statePath)) {
+        const d = JSON.parse(fs.readFileSync(this.statePath, 'utf8'));
+        d.accounts = d.accounts || {};
+        d.conversations = d.conversations || {};
+        return d;
+      }
     } catch (e) { /* ignore */ }
-    return { accounts: {} };
+    return { accounts: {}, conversations: {} };
+  }
+
+  // ---------- 全局并发（避免 DSH 并发请求打爆同一账号） ----------
+
+  _acquireSlot() {
+    const max = Math.max(1, this.cfg.globalMaxConcurrency ?? 2);
+    if (this.running < max) { this.running++; return Promise.resolve(); }
+    return new Promise((resolve, reject) => {
+      const entry = { resolve, timer: null };
+      entry.timer = setTimeout(() => {
+        const i = this.queue.indexOf(entry);
+        if (i >= 0) this.queue.splice(i, 1);
+        reject(new DoubaoError('ratelimit', '全局并发排队超时，请稍后重试'));
+      }, this.cfg.queueWaitMs ?? 30000);
+      this.queue.push(entry);
+    });
+  }
+
+  _releaseSlot() {
+    const next = this.queue.shift();
+    if (next) { clearTimeout(next.timer); next.resolve(); }
+    else this.running = Math.max(0, this.running - 1);
+  }
+
+  // ---------- 按日用量（平台不提供余量接口，只能自记账） ----------
+
+  _bumpDaily(id, chars) {
+    const st = this._accState(id);
+    const today = dayKeyCN();
+    if (st.day !== today) { st.day = today; st.dayReq = 0; st.dayChars = 0; }
+    st.dayReq = (st.dayReq || 0) + 1;
+    st.dayChars = (st.dayChars || 0) + chars;
+    this._scheduleSave();
   }
 
   _accState(id) {
@@ -71,17 +123,25 @@ export class DoubaoClient {
     return this.state.accounts[id];
   }
 
+  _syncConversations() {
+    const now = Date.now();
+    const ttl = (this.cfg.conversationTtlSec ?? 1800) * 1000;
+    const out = {};
+    for (const [k, v] of this.convMap) if (now - v.ts < ttl) out[k] = v;
+    this.state.conversations = out;
+  }
+
   _scheduleSave() {
     if (this._saveTimer || !this.statePath) return;
     this._saveTimer = setTimeout(() => {
       this._saveTimer = null;
-      try { fs.writeFileSync(this.statePath, JSON.stringify(this.state, null, 2)); } catch (e) { /* ignore */ }
+      try { this._syncConversations(); fs.writeFileSync(this.statePath, JSON.stringify(this.state, null, 2)); } catch (e) { /* ignore */ }
     }, 2000);
   }
 
   flushState() {
     if (this._saveTimer) { clearTimeout(this._saveTimer); this._saveTimer = null; }
-    if (this.statePath) { try { fs.writeFileSync(this.statePath, JSON.stringify(this.state, null, 2)); } catch (e) { /* ignore */ } }
+    if (this.statePath) { try { this._syncConversations(); fs.writeFileSync(this.statePath, JSON.stringify(this.state, null, 2)); } catch (e) { /* ignore */ } }
   }
 
   // ---------- 账号池 ----------
@@ -167,6 +227,16 @@ export class DoubaoClient {
     this.log('warn', `账号 ${acc.id}(${acc.remark || ''}) 冷却 ${seconds}s：${reason}`);
   }
 
+  /** 额度耗尽：冷却到北京时间次日零点（额度按自然日重置） */
+  coolUntilMidnight(acc, reason) {
+    const st = this._accState(acc.id);
+    st.coolUntil = Date.now() + msUntilMidnightCN();
+    st.lastError = reason;
+    this._scheduleSave();
+    const mins = Math.ceil((st.coolUntil - Date.now()) / 60000);
+    this.log('warn', `账号 ${acc.id} 额度用尽，冷却至次日零点（约 ${mins} 分钟）：${reason}`);
+  }
+
   markAuthError(acc, reason) {
     const st = this._accState(acc.id);
     st.authError = true;
@@ -176,13 +246,21 @@ export class DoubaoClient {
   }
 
   snapshot() {
+    const base = this.cfg.dailyQuota ?? 200;
+    const quota = isMondayCN() ? base * 2 : base; // 周一翻倍
+    const today = dayKeyCN();
     return this._accounts().map(a => {
       const st = this._accState(a.id);
       const now = Date.now();
+      if (st.day !== today) { st.day = today; st.dayReq = 0; st.dayChars = 0; }
+      const todayReq = st.dayReq || 0;
       return {
         id: a.id, remark: a.remark || '', enabled: a.enabled !== false,
         status: st.authError ? 'Cookie失效' : (st.coolUntil > now ? `冷却至 ${new Date(st.coolUntil).toLocaleTimeString('zh-CN')}` : '可用'),
-        totalReq: st.totalReq || 0, totalChars: st.totalChars || 0, lastError: st.lastError || '',
+        totalReq: st.totalReq || 0, totalChars: st.totalChars || 0,
+        todayReq, todayChars: st.dayChars || 0,
+        quotaLeftEst: Math.max(0, quota - todayReq),
+        lastError: st.lastError || '',
       };
     });
   }
@@ -239,6 +317,7 @@ export class DoubaoClient {
   rememberConversation(key, conversationId, msgCount) {
     if (!key || !conversationId) return;
     this.convMap.set(key, { conversationId, msgCount, ts: Date.now() });
+    this._scheduleSave();
     if (this.convMap.size > 100) {
       const oldest = [...this.convMap.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
       if (oldest) this.convMap.delete(oldest[0]);
@@ -378,9 +457,18 @@ export class DoubaoClient {
 
     if (!res.ok) {
       const t = await res.text().catch(() => '');
-      if (res.status === 401) throw new DoubaoError('auth', '登录态失效 HTTP 401', 401);
-      if (res.status === 429 || res.status === 403) throw new DoubaoError('ratelimit', `限流 HTTP ${res.status}: ${t.slice(0, 120)}`, res.status);
-      throw new DoubaoError('upstream', `上游错误 HTTP ${res.status}: ${t.slice(0, 120)}`, res.status);
+      const retryAfter = Number(res.headers.get('retry-after') || 0);
+      const quotaHint = /quota|额度|exceed|insufficient|余额不足/i.test(t);
+      const withHint = (err) => { err.retryAfter = retryAfter; err.body = t.slice(0, 300); return err; };
+      if (res.status === 401) throw withHint(new DoubaoError('auth', '登录态失效 HTTP 401', 401));
+      if (res.status === 429) throw withHint(new DoubaoError('ratelimit', `限流 HTTP 429: ${t.slice(0, 120)}`, 429));
+      // 403 既可能是风控也可能是额度耗尽，按响应体措辞区分
+      if (res.status === 403) {
+        if (quotaHint) throw withHint(new DoubaoError('quota', `额度不足 HTTP 403: ${t.slice(0, 120)}`, 403));
+        throw withHint(new DoubaoError('ratelimit', `风控/限流 HTTP 403: ${t.slice(0, 120)}`, 403));
+      }
+      if (quotaHint) throw withHint(new DoubaoError('quota', `额度不足 HTTP ${res.status}: ${t.slice(0, 120)}`, res.status));
+      throw withHint(new DoubaoError('upstream', `上游错误 HTTP ${res.status}: ${t.slice(0, 120)}`, res.status));
     }
 
     const ct = res.headers.get('content-type') || '';
@@ -457,6 +545,7 @@ export class DoubaoClient {
     st.totalChars += full.length;
     st.authError = false; // 换新 Cookie 后自动恢复，不再永久显示"失效"
     st.lastError = '';
+    this._bumpDaily(account.id, full.length);
     this._scheduleSave();
     this.log('info', `上游完成 账号=${account.id} 字数=${full.length} 耗时=${ms}ms`, { acc: account.id, ms, chars: full.length });
 
@@ -474,6 +563,8 @@ export class DoubaoClient {
     const maxAttempts = Math.max(1, this.cfg.maxAttempts ?? 2);
     const tried = new Set();
     let lastErr = null;
+    await this._acquireSlot();
+    try {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const acc = this.pickAccount(tried);
       if (!acc) {
@@ -501,7 +592,12 @@ export class DoubaoClient {
           lastErr = e;
           if (e.kind === 'aborted') throw e;
           if (e.kind === 'auth') this.markAuthError(acc, e.message);
-          else if (e.kind === 'ratelimit') this.coolAccount(acc, this.cfg.coolSeconds ?? 86400, e.message);
+          else if (e.kind === 'quota') this.coolUntilMidnight(acc, e.message);
+          else if (e.kind === 'ratelimit') {
+            // 有 Retry-After 就按它冷却（最多 24h），否则用配置的长冷却
+            const sec = e.retryAfter > 0 ? Math.min(e.retryAfter, 86400) : (this.cfg.coolSeconds ?? 86400);
+            this.coolAccount(acc, sec, e.message);
+          }
           else if (e.kind === 'upstream' || e.kind === 'empty') this.coolAccount(acc, this.cfg.shortCoolSeconds ?? 300, e.message);
           // network：不冷却，直接换号重试
           this.log('warn', `账号 ${acc.id} 尝试失败(${e.kind})：${e.message}，尝试下一个账号`);
@@ -511,5 +607,8 @@ export class DoubaoClient {
       }
     }
     throw lastErr || new DoubaoError('upstream', '所有尝试均失败');
+    } finally {
+      this._releaseSlot();
+    }
   }
 }
