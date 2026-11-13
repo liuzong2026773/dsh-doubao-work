@@ -6,6 +6,9 @@
  * 覆盖：插件导出契约、路由注册、/doubao/status 返回、会话复用闸门、额度估算格式。
  */
 import { EventEmitter } from 'node:events';
+import os from 'node:os';
+import path from 'node:path';
+import { pathToFileURL } from 'node:url';
 import assert from 'node:assert';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -14,6 +17,9 @@ let passed = 0;
 const ok = (name, fn) => { fn(); passed++; console.log('  ✓ ' + name); };
 
 const mod = await import('../index.js');
+// 1.2.5 起 Cookie 与用量状态写在数据目录（默认 <dshHome>/doubao-work）；
+// 测试用临时目录，既不污染真实安装，也证明状态不再落在插件目录里。
+const DATA_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-doubao-test-'));
 
 console.log('插件契约');
 ok('导出 name/apply/inject', () => {
@@ -35,7 +41,7 @@ const ctx = {
 };
 
 console.log('加载与注册');
-ok('apply 不抛异常', () => mod.apply(ctx, { providerId: 'doubao-work', providerName: '测试', accounts: [] }));
+ok('apply 不抛异常', () => mod.apply(ctx, { providerId: 'doubao-work', providerName: '测试', accounts: [], dataDir: DATA_DIR }));
 ok('注册了 provider', () => assert.deepEqual(adapterProviders, ['doubao-work']));
 ok('注册了预期路由集合（8 精确 + 1 /api 前缀）', () => {
   assert.deepEqual(Object.keys(routes).sort(), [
@@ -52,7 +58,7 @@ ok('注册了预期路由集合（8 精确 + 1 /api 前缀）', () => {
 });
 ok('拿不到 webServer 时降级不崩', () => {
   const noop = { llm: { registerAdapter() {} }, get: () => undefined };
-  mod.apply(noop, { providerId: 'doubao-work', accounts: [] });
+  mod.apply(noop, { providerId: 'doubao-work', accounts: [], dataDir: DATA_DIR });
 });
 
 /** 与宿主一致的派发：精确优先，否则取最长前缀 */
@@ -231,8 +237,8 @@ ok('/api/doubao/checkin 前缀可达', () => assert.equal(ciViaPrefix.code, 200)
 
 console.log('账号管理接口');
 const COOKIE = 'sessionid=test1234567890abcdef; sid_guard=x; uid_tt=y';
-const ACCOUNTS_JSON = fileURLToPath(new URL('../accounts.json', import.meta.url));
-try { fs.unlinkSync(ACCOUNTS_JSON); } catch (e) { /* 不存在即可 */ }
+const ACCOUNTS_JSON = path.join(DATA_DIR, 'accounts.json');
+
 
 const addOk = await call('/doubao/account/add', { id: 'acc-9', remark: '测试号', cookie: COOKIE });
 ok('添加账号返回 id', () => {
@@ -279,7 +285,7 @@ const ctx2 = {
   get: () => webServer,
   inject: (deps, cb) => cb({ webServer, effect: (fn) => fn() }),
 };
-mod.apply(ctx2, { providerId: 'doubao-work', accounts: [{ id: 'cfg-1', cookie: COOKIE, remark: '面板号' }] });
+mod.apply(ctx2, { providerId: 'doubao-work', accounts: [{ id: 'cfg-1', cookie: COOKIE, remark: '面板号' }], dataDir: DATA_DIR });
 const cfgDisable = await call('/doubao/account/enable', { id: 'cfg-1', enabled: false });
 ok('配置面板账号也能停用（写入覆盖记录）', () => assert.equal(cfgDisable.code, 200));
 const cfgFile = JSON.parse(fs.readFileSync(ACCOUNTS_JSON, 'utf8')).accounts.find(a => a.id === 'cfg-1');
@@ -291,7 +297,64 @@ const stCfg = JSON.parse((await call('/doubao/status')).body);
 ok('面板账号停用后状态为已停用', () => {
   assert.equal(stCfg.accounts.find(a => a.id === 'cfg-1').status, '已停用');
 });
-try { fs.unlinkSync(ACCOUNTS_JSON); } catch (e) { /* ignore */ }
+console.log('数据目录与宿主包解析');
+const paths = await import('../paths.js');
+const host = await import('../host.js');
+ok('显式 dataDir 优先于 dshHome', () => {
+  assert.equal(paths.resolveDataDir({ explicit: DATA_DIR, dshHome: '/tmp/whatever' }), DATA_DIR);
+});
+ok('没有显式目录时落在 <dshHome>/doubao-work', () => {
+  const fakeHome = path.join(DATA_DIR, 'fake-home');
+  assert.equal(paths.resolveDataDir({ dshHome: fakeHome }), path.join(fakeHome, 'doubao-work'));
+});
+ok('旧位置（插件目录）的 Cookie 文件会被复制过去，且保留原件', () => {
+  const legacy = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-doubao-legacy-'));
+  const target = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-doubao-target-'));
+  fs.writeFileSync(path.join(legacy, 'accounts.json'), JSON.stringify({ accounts: [{ id: 'a1', cookie: 'old-cookie-value' }] }));
+  const msgs = [];
+  const r = paths.dataPaths({ explicit: target, legacyDir: legacy, onMigrate: m => msgs.push(m) });
+  assert.equal(JSON.parse(fs.readFileSync(r.accountsPath, 'utf8')).accounts[0].cookie, 'old-cookie-value');
+  assert.ok(fs.existsSync(path.join(legacy, 'accounts.json')), '迁移应保留原文件');
+  assert.equal(msgs.length, 1);
+  // 目标已有文件时不能被旧数据盖回去（升级后再迁移不能回滚 Cookie）
+  fs.writeFileSync(r.accountsPath, JSON.stringify({ accounts: [{ id: 'a1', cookie: 'newer-cookie' }] }));
+  paths.dataPaths({ explicit: target, legacyDir: legacy });
+  assert.equal(JSON.parse(fs.readFileSync(r.accountsPath, 'utf8')).accounts[0].cookie, 'newer-cookie');
+  fs.rmSync(legacy, { recursive: true, force: true });
+  fs.rmSync(target, { recursive: true, force: true });
+});
+ok('Cookie 落在数据目录，不再写进插件目录', () => {
+  assert.equal(fs.existsSync(fileURLToPath(new URL('../accounts.json', import.meta.url))), false,
+    '插件目录里不该再有 accounts.json');
+  assert.ok(fs.existsSync(ACCOUNTS_JSON), '面板写入应落在数据目录');
+});
+ok('兜底错误类把 code/failure 都写成自身数据属性（宿主按快照取码）', () => {
+  const e = new host.LocalLlmError('上游限流', 'RATE_LIMIT', { status: 429, providerRetryAfterMs: 60000 });
+  assert.equal(e.name, 'LlmError');
+  assert.equal(e.code, 'RATE_LIMIT');
+  assert.ok('value' in Object.getOwnPropertyDescriptor(e, 'code'), 'ownErrorCode 只认自身数据属性');
+  assert.ok('value' in Object.getOwnPropertyDescriptor(e, 'failure'), 'ownFailureSnapshot 只认自身数据属性');
+  // 宿主 normalizeLlmFailure 的条件是 carried.code === ownErrorCode(error)
+  assert.equal(e.failure.code, e.code);
+  assert.equal(e.failure.providerRetryAfterMs, 60000);
+});
+ok('宿主包解析来源可见', () => {
+  assert.ok(['bare', 'install:', 'missing'].some(k => host.resolvedFrom['dsh-llm'].startsWith(k)), host.resolvedFrom['dsh-llm']);
+  assert.ok(host.LlmError, '应有 LlmError（宿主那份或本地兜底）');
+});
+const rt = JSON.parse((await call('/doubao/status')).body);
+ok('status 暴露解析来源与版本，便于线上排障', () => {
+  assert.ok(rt.runtime && rt.runtime.host['dsh-llm'], '缺少 runtime 诊断字段');
+  assert.match(rt.runtime.version, /^\d+\.\d+\.\d+$/);
+});
+ok('DEFAULTS 与 Config 默认值一致（防两处漂移）', () => {
+  if (!mod.Config) return; // 解析不到 schemastery 时只有 DEFAULTS 生效
+  const filled = mod.Config({});
+  for (const [k, v] of Object.entries(mod.DEFAULTS)) {
+    if (k === 'upstream') { assert.deepEqual(filled.upstream, v, 'upstream 默认值不一致'); continue; }
+    assert.deepEqual(filled[k], v, `${k} 默认值不一致`);
+  }
+});
 
 console.log('适配器错误码与流协议');
 const { DoubaoLlmAdapter, ERROR_CODES } = mod;
@@ -351,6 +414,11 @@ ok('providerRetryPolicy 结构可被宿主接受', () => {
   assert.ok(Number.isInteger(p.maxRetries) && p.maxRetries >= 0);
   assert.ok(Array.isArray(p.retryableCodes) && !p.retryableCodes.includes('RATE_LIMIT'), 'RATE_LIMIT 不该让宿主立刻重试');
   assert.ok(p.backoff.initialDelayMs > 0 && p.backoff.maxDelayMs >= p.backoff.initialDelayMs);
+});
+
+ok('VERSION 与 package.json 一致', async () => {
+  const pkg = JSON.parse(fs.readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
+  assert.equal(mod.VERSION, pkg.version);
 });
 
 console.log('\n全部通过：' + passed + ' 项');

@@ -1,6 +1,6 @@
 {
   "name": "dsh-doubao-work",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -13,6 +13,8 @@
     "index.js",
     "client.js",
     "doubao.js",
+    "host.js",
+    "paths.js",
     "cordis.patch.yml",
     "standalone",
     "tools",
@@ -20,7 +22,8 @@
     "docs"
   ],
   "scripts": {
-    "test": "node tests/smoke.mjs && node tests/upstream.mjs"
+    "test": "node tests/smoke.mjs && node tests/upstream.mjs",
+    "test:install": "node tests/profile-install.mjs"
   },
   "keywords": [
     "dsh-plugin",

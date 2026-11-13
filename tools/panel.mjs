@@ -12,10 +12,12 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { DoubaoClient } from '../doubao.js';
+import { dataPaths } from '../paths.js';
 
 const dir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const accountsPath = path.join(dir, 'accounts.json');
-const statePath = path.join(dir, 'gateway-state.json');
+const paths = dataPaths({ legacyDir: dir });
+const accountsPath = paths.accountsPath;
+const statePath = paths.statePath;
 const argPort = process.argv.indexOf('--port');
 const port = argPort > 0 ? Number(process.argv[argPort + 1]) : 3041;
 

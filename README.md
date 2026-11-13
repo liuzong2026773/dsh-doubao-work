@@ -19,10 +19,30 @@
 
 ## 安装
 
-1. 把本目录放到 DSH 可访问的插件目录
-2. 按 DSH 插件bundle 机制挂载 `cordis.patch.yml`
-3. 在插件配置面板的 `accounts` 里填入豆包 Cookie（见下）
-4. 重启/刷新后，模型列表出现「豆包工作（免费额度）」
+桌面版用自带的插件 CLI（本质是在 profile 目录里跑 pnpm）：
+
+```powershell
+# Windows：桌面版 CLI 在安装目录的 resources/runtime/cli/bin 下
+& "$env:LOCALAPPDATA\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd" `
+  plugin --profile desktop add "file:C:\路径\dsh-doubao-work"
+```
+
+升级时 pnpm 会**整目录重抄**一遍 `node_modules/dsh-doubao-work`，所以要先 `remove` 再 `add`
+（`add` 对同一个 `file:` 依赖会说 "Already up to date"，不会刷新内容）。
+
+装完**必须重启 DSH** 才会加载（profile 的 bundle 花名册在启动时读取）。重启后：
+
+1. 设置 → 模型接入 → 「豆包工作」里填 Cookie，或直接调用 `/doubao/account/add`
+2. 模型列表出现「豆包工作（免费额度）」，选择 `doubao-work / deepseek-v4.1-flash` 等
+3. 浏览器打开 `http://127.0.0.1:<端口>/doubao/status`，看 `runtime.host` 是否为
+   `install:<安装目录>`——这是确认插件真的从安装目录拿到了宿主包（原理见「更新记录」1.2.5）
+
+> 从 profile 安装的第三方插件旁边只有它自己，没有 `@deepseek-ai/*`。宿主的 loader 只把
+> **插件入口那一个裸名**重定向到安装目录，插件内部的 `import '@deepseek-ai/dsh-llm'`
+> 仍按 Node 默认规则查找，于是加载期就 `ERR_MODULE_NOT_FOUND`。`host.js` 负责回到安装目录
+> 取宿主那一份；不能靠 pnpm 再装一份副本，因为宿主的 `harnessErrorCode()` 用
+> `error instanceof HarnessError` 取错误码，第二份副本会让 AUTH/RATE_LIMIT/QUOTA 全部退化成 UNKNOWN。
+
 
 ## 获取 Cookie
 
@@ -46,7 +66,11 @@
 
 **方式 A：DSH 插件配置面板** —— 在 `accounts` 数组里加一项，填 `cookie` + `remark`，由 DSH 自己持久化配置。
 
-**方式 B：accounts.json 文件（推荐，改文件即生效，无需重启 DSH）** —— 在插件目录放一个 `accounts.json`：
+**方式 B：accounts.json 文件（推荐，改文件即生效，无需重启 DSH）** —— 在**数据目录**放一个 `accounts.json`：
+
+> 数据目录默认是 `<dshHome>/doubao-work/`（Windows 即 `C:\Users\<你>\.dsh\doubao-work\`）。
+> 1.2.5 之前它在插件目录里，而插件装在 `node_modules` 下，升级会被整目录重抄导致 Cookie 丢失；
+> 老文件会在插件首次加载时自动迁移过去。可用配置项 `dataDir` 或环境变量 `DSH_DOUBAO_DATA_DIR` 覆盖。
 
 ```json
 {
@@ -87,10 +111,12 @@
 dsh-doubao-work/
 ├── index.js           # 插件主体：注册 LlmAdapter + 状态/管理接口
 ├── doubao.js          # 上游内核：Cookie 直连 / SSE 解析 / 账号池 / 冷却 / 会话复用
+├── host.js            # 宿主包解析：从安装目录取 @deepseek-ai/*（profile 安装的关键）
+├── paths.js           # 数据目录：Cookie/状态放 <dshHome>/doubao-work，升级不丢
 ├── client.js          # 浏览器半身：设置页「豆包工作」
 ├── package.json
 ├── cordis.patch.yml
-├── tests/             # smoke.mjs（契约/接口）、upstream.mjs（本地假上游）
+├── tests/             # smoke.mjs（契约/接口）、upstream.mjs（本地假上游）、profile-install.mjs（安装形态）
 ├── tools/             # status / accounts / panel / git-api-push
 └── standalone/        # 同内核的 OpenAI 兼容网关（独立进程）
 ```
@@ -110,8 +136,10 @@ dsh-doubao-work/
 离线自检（不重启、不联网、不耗额度）：
 
 ```bash
-node tests/smoke.mjs      # 契约/路由/账号管理/签到/错误码/复用规划/流协议，共 57 项
+node tests/smoke.mjs      # 契约/路由/账号管理/签到/数据目录/错误码/复用规划/流协议，共 66 项
 node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到，共 17 项
+ELECTRON_RUN_AS_NODE=1 DSH_HOST_MODULES="<安装目录>/app.asar/dsh/node_modules" \
+  "<安装目录>/DeepSeek Harness.exe" tests/profile-install.mjs   # 模拟 profile 安装，6 项
 ```
 
 数据来自宿主同源接口（双前缀，`/api/doubao/*` 与 `/doubao/*` 等价）：
@@ -159,9 +187,12 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
 
 ## 状态接口（插件内，需重启 DSH 后生效）
 
-- `GET  /doubao/status`（或 `/api/doubao/status`）— 账号池（含停用）+ 今日用量 + 会话数
+- `GET  /doubao/status`（或 `/api/doubao/status`）— 账号池（含停用）+ 今日用量 + 会话数 +
+  `runtime.host`（宿主包解析来源，排查「装上了但没生效」先看这里）
 - `POST /doubao/check` — 逐账号健康检查
 - `POST /doubao/account/add|update|enable|remove` — 账号增删改启停（`update` 用于换 Cookie，不用删了再加）
+- `POST /doubao/checkin` — 全部账号（或 `{"id":"acc-1"}` 单号）每日签到，返回 ok/already/skipped/failed 汇总
+- `POST /doubao/checkin/status` — 单账号今日签到状态（`{"id":"acc-1"}`）
 
 **访问控制**：带 `Origin` 的浏览器请求必须同源；不带 `Origin` 的调用只放行本机（`127.0.0.1` / `::1`）。
 需要从别的机器调管理接口时，在配置里设 `adminToken`，并带上请求头：
@@ -224,6 +255,24 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 
 ## 更新记录
 
+- **1.2.5**（2026-11-13，修的是「装上就加载不了」）：
+  - **profile 安装后加载失败（P0，已修）**：宿主的 loader 只把**插件入口那一个裸名**重定向到安装目录
+    （`HostResolvedRootInclude.import`），插件内部的 `import '@deepseek-ai/dsh-llm'` 仍按 Node 默认规则
+    查找；profile 的 `node_modules` 里只有插件自己，于是加载期直接 `ERR_MODULE_NOT_FOUND`。仓库内开发有
+    开发副本所以看不出问题——这个插件此前其实从未真正装载过。新增 `host.js`：显式回到安装目录
+    （`process.resourcesPath` 下的 `app.asar/dsh/node_modules`）取宿主**同一份**模块，保证
+    `LlmError instanceof HarnessError` 成立（换成 pnpm 再装一份副本的话，错误码会整体退化成 UNKNOWN）。
+    实在取不到才退化为本地兜底错误类：把 `code` 与 `failure` 都写成自身数据属性，宿主
+    `normalizeLlmFailure()` 的快照路径同样认得，错误码依然不丢。`/doubao/status` 增加 `runtime.host`
+    显示解析来源（`bare` / `install:<目录>`），线上可自查。
+  - **升级会丢 Cookie（P1，已修）**：`accounts.json` 与 `gateway-state.json` 原来写在插件目录里，
+    而 `dsh plugin add` 升级会把 `node_modules/dsh-doubao-work` 整目录重抄一遍，Cookie 跟着丢。
+    新增 `paths.js`：默认落到 `<dshHome>/doubao-work/`（与 dsh-ops 同构），首次使用自动从插件目录迁移
+    并保留原件；可用配置项 `dataDir` 或环境变量 `DSH_DOUBAO_DATA_DIR` 指定；`tools/` 下四个命令行
+    小工具同步改用同一份文件。
+  - **新增安装形态自测**：`tests/profile-install.mjs` 用 Electron 的 node 模式把插件复制到没有
+    `node_modules` 的临时目录里加载，验证「从安装目录拿到宿主包」「LlmError 与宿主同一个类」等 6 项；
+    普通 node 环境自动跳过。
 - **1.2.4**（2026-11-13）：
   - **复用起点改为尾部锚定（P1）**：`planReuse()` 原先按 `e.msgCount` 下标切片，而宿主会在**头部**重注入
     system/上下文块，下标整体右移——于是起点落在旧的 user 消息上，把上游已有的消息再发一遍

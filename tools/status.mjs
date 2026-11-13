@@ -6,15 +6,17 @@
  *   node tools/status.mjs --check    # 额外校验每个账号 Cookie 是否还有效
  *   node tools/status.mjs --quota    # 额外查询每个账号的订阅额度
  *
- * 数据来源：插件目录下的 accounts.json（与插件热加载同一个文件）。
+ * 数据来源：数据目录里的 accounts.json（默认 <dshHome>/doubao-work，与插件热加载同一个文件）。
  */
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { DoubaoClient } from '../doubao.js';
+import { dataPaths } from '../paths.js';
 
 const dir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const accountsPath = path.join(dir, 'accounts.json');
+const paths = dataPaths({ legacyDir: dir });
+const accountsPath = paths.accountsPath;
 
 let accounts = [];
 try {
@@ -26,7 +28,7 @@ try {
 }
 
 const client = new DoubaoClient({ accounts }, {
-  statePath: path.join(dir, 'gateway-state.json'),
+  statePath: paths.statePath,
   accountsPath,
   log: () => {},
 });

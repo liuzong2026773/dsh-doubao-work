@@ -8,8 +8,8 @@
  * 任一请求 → Request Headers → 复制完整 Cookie 值，粘贴到插件配置的 cookie 字段。
  */
 
-import Schema from '@deepseek-ai/schemastery';
-import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm';
+import { Schema, LlmAdapter, LlmError, resolvedFrom } from './host.js';
+import { dataPaths } from './paths.js';
 import { DoubaoClient, DoubaoError, BUILTIN_MODELS, conversationKey } from './doubao.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -18,21 +18,24 @@ import { fileURLToPath } from 'node:url';
 export const name = 'dsh-doubao-work';
 export const inject = ['llm'];
 
+/** 宿主没解析到时退化成空基类：registerAdapter 只鸭子校验 providerInfo/stream */
+const AdapterBase = LlmAdapter ?? class {};
+
 // ---------------- 配置面板 ----------------
 
-const AccountSchema = Schema.object({
+const AccountSchema = Schema && Schema.object({
   cookie: Schema.string().description('豆包网页版完整 Cookie（浏览器 F12 复制整行 Cookie 值）').default(''),
   remark: Schema.string().description('账号备注').default(''),
   enabled: Schema.boolean().description('启用此账号').default(true),
 });
 
-const ExtraModelSchema = Schema.object({
+const ExtraModelSchema = Schema && Schema.object({
   id: Schema.string().description('模型 ID（DSH 中显示的调用名）').required(),
   name: Schema.string().description('显示名称').default(''),
   modelItemKey: Schema.string().description('豆包 model_item_key（抓包获取）').required(),
 });
 
-export const Config = Schema.object({
+export const Config = Schema && Schema.object({
   accounts: Schema.array(AccountSchema).description('豆包账号池（支持多账号轮询）').default([]),
   strategy: Schema.union([
     Schema.const('round-robin').description('轮询'),
@@ -57,6 +60,7 @@ export const Config = Schema.object({
   queueWaitMs: Schema.number().description('并发排队最长等待（毫秒），超时按限流报错').min(0).default(30000),
   dailyQuota: Schema.number().description('单账号每日额度估算基数（周一翻倍，仅用于面板推算，非官方数字）').min(1).default(200),
   adminToken: Schema.string().description('跨机管理令牌：仅在非本机访问管理接口时需要，留空则只允许本机调用').default(''),
+  dataDir: Schema.string().description('Cookie 与用量状态的存放目录（留空用 <dshHome>/doubao-work；不要放插件目录，升级会被覆盖）').default(''),
   upstream: Schema.object({
     aid: Schema.string().description('应用 ID').default('497858'),
     device_id: Schema.string().description('设备 ID').default('7707509248230065699'),
@@ -70,6 +74,57 @@ export const Config = Schema.object({
     tz_name: Schema.string().description('时区名').default('Asia/Shanghai'),
   }).description('上游设备参数（默认值取自实测抓包，通常无需改动）'),
 });
+
+/** 插件版本（与 package.json 同步，状态接口用于排障） */
+export const VERSION = '1.2.5';
+
+/**
+ * 配置默认值。
+ *
+ * 正常情况下宿主用上面的 `Config` 校验补默认值；但插件从 profile 安装、宿主又解析不到
+ * schemastery 时 `Config` 会是 undefined，`config.providerId` 这类字段就成了 undefined。
+ * 这张表是那种情况下的兜底。测试会比对它与 `Config` 的默认值，防止两处漂移。
+ */
+export const DEFAULTS = {
+  accounts: [],
+  strategy: 'round-robin',
+  rpmPerAccount: 6,
+  coolSeconds: 86400,
+  shortCoolSeconds: 300,
+  maxAttempts: 2,
+  providerId: 'doubao-work',
+  providerName: '豆包工作（免费额度）',
+  extraModels: [],
+  reasoningEffort: 0,
+  contextReuse: true,
+  conversationTtlSec: 1800,
+  baseUrl: 'https://www.doubao.com',
+  requestTimeoutMs: 180000,
+  globalMaxConcurrency: 2,
+  queueWaitMs: 30000,
+  dailyQuota: 200,
+  adminToken: '',
+  dataDir: '',
+  upstream: {
+    aid: '497858',
+    device_id: '7707509248230065699',
+    web_id: '7707509253662393906',
+    tea_uuid: '',
+    fp: 'verify_mwehdj77_p7te0LWd_xEFZ_4N2S_8jDq_L7Zl4uO5iI5F',
+    pc_version: '3.45.5',
+    version_code: '20800',
+    region: 'CN',
+    language: 'zh',
+    tz_name: 'Asia/Shanghai',
+  },
+};
+
+/** 补齐默认值（upstream 需要一层浅合并） */
+export function withDefaults(config) {
+  const cfg = { ...DEFAULTS, ...(config || {}) };
+  cfg.upstream = { ...DEFAULTS.upstream, ...(cfg.upstream || {}) };
+  return cfg;
+}
 
 // ---------------- OpenAI Message → 豆包文本 ----------------
 
@@ -132,7 +187,7 @@ function messagesToText(options) {
 
 // ---------------- LlmAdapter ----------------
 
-export class DoubaoLlmAdapter extends LlmAdapter {
+export class DoubaoLlmAdapter extends AdapterBase {
   /** @param {{ client: DoubaoClient, config: object, log: Function }} deps */
   constructor(deps) {
     super();
@@ -262,7 +317,9 @@ export class DoubaoLlmAdapter extends LlmAdapter {
 
 // ---------------- 插件入口 ----------------
 
-export function apply(ctx, config) {
+export function apply(ctx, rawConfig) {
+  // Config 能导出时宿主已补过默认值；导出不了（解析不到 schemastery）时靠 DEFAULTS 兜底
+  const config = withDefaults(rawConfig);
   const log = (level, msg, extra) => {
     try {
       const l = ctx.logger;
@@ -275,10 +332,21 @@ export function apply(ctx, config) {
   const accounts = (config.accounts || []).map((a, i) => ({ ...a, id: a.id || `acc-${i + 1}` }));
 
   const pluginDir = path.dirname(fileURLToPath(import.meta.url));
+  // Cookie 与用量状态不放插件目录：profile 安装的插件在 node_modules 里，
+  // 升级会被整目录重抄，Cookie 会丢。见 paths.js。
+  let dshHome = '';
+  try { dshHome = String(ctx?.get?.('dshHomePath') || ''); } catch (e) { /* 测试用的 ctx 没有这个服务 */ }
+  const files = dataPaths({
+    explicit: config.dataDir,
+    dshHome,
+    legacyDir: pluginDir,
+    onMigrate: (msg) => log('info', msg),
+  });
   const client = new DoubaoClient(
     { ...config, accounts },
-    { statePath: path.join(pluginDir, 'gateway-state.json'), accountsPath: path.join(pluginDir, 'accounts.json'), log },
+    { statePath: files.statePath, accountsPath: files.accountsPath, log },
   );
+  log('info', `数据目录：${files.dir}`);
 
   const models = client.models();
   log('info', `已注册 provider "${config.providerId}"：${models.map(m => m.id).join(', ')}｜账号 ${accounts.filter(a => a.enabled !== false).length} 个`);
@@ -325,6 +393,8 @@ export function apply(ctx, config) {
             },
             conversations: client.convMap.size,
             contextReuse: config.contextReuse !== false,
+            // 宿主包从哪来的：bare=常规解析；install:<dir>=从安装目录取（profile 安装的正常情况）
+            runtime: { host: { ...resolvedFrom }, version: VERSION },
             // 诊断字段：宿主最近一次实际下发的模型名 + 会话复用情况
             lastModel: client.lastModel || '',
             lastModelAt: client.lastModelAt || 0,
@@ -336,12 +406,12 @@ export function apply(ctx, config) {
       });
       const readAccountsFile = () => {
         try {
-          const d = JSON.parse(fs.readFileSync(path.join(pluginDir, 'accounts.json'), 'utf8').replace(/^\uFEFF/, ''));
+          const d = JSON.parse(fs.readFileSync(files.accountsPath, 'utf8').replace(/^﻿/, ''));
           return Array.isArray(d) ? d : (d.accounts || []);
         } catch (e) { return []; }
       };
       const writeAccountsFile = (list) => {
-        const p = path.join(pluginDir, 'accounts.json');
+        const p = files.accountsPath;
         fs.writeFileSync(p, JSON.stringify({ accounts: list }, null, 2), { mode: 0o600 });
         try { fs.chmodSync(p, 0o600); } catch (e) { /* ignore */ }
       };

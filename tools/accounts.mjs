@@ -16,9 +16,11 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { dataPaths } from '../paths.js';
 
 const dir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const file = path.join(dir, 'accounts.json');
+const paths = dataPaths({ legacyDir: dir });
+const file = paths.accountsPath;
 
 function load() {
   try {
@@ -73,7 +75,7 @@ if (cmd === 'list') {
   save(data);
   console.log('已' + ({ enable: '启用', disable: '停用', remove: '删除' }[cmd]) + ' ' + id);
 } else if (cmd === 'export') {
-  const out = opt('out', path.join(dir, 'accounts-backup.json'));
+  const out = opt('out', path.join(paths.dir, 'accounts-backup.json'));
   fs.writeFileSync(out, JSON.stringify(data, null, 2), { mode: 0o600 });
   fs.chmodSync(out, 0o600);
   console.log('已导出到 ' + out + '（含 Cookie，注意保管）');

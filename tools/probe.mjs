@@ -11,9 +11,11 @@ import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { DoubaoClient } from '../doubao.js';
+import { dataPaths } from '../paths.js';
 
 const dir = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const accountsPath = path.join(dir, 'accounts.json');
+const paths = dataPaths({ legacyDir: dir });
+const accountsPath = paths.accountsPath;
 const args = new Set(process.argv.slice(2));
 
 function loadAccounts() {
@@ -33,7 +35,7 @@ if (!accounts.length) {
   process.exit(1);
 }
 
-const client = new DoubaoClient({ accounts }, { statePath: path.join(dir, 'gateway-state.json'), log: () => {} });
+const client = new DoubaoClient({ accounts }, { statePath: paths.statePath, log: () => {} });
 const acc = accounts[0];
 console.log('账号: ' + acc.id + ' (' + (acc.remark || '无备注') + ')  cookie 长度=' + acc.cookie.trim().length);
 
