@@ -103,10 +103,11 @@ dsh-doubao-work/
 离线自检（不重启、不耗额度）：
 
 ```bash
-node tests/smoke.mjs     # 契约/路由/接口/会话闸门，共 10 项
+node tests/smoke.mjs     # 契约/路由/接口/会话闸门，共 13 项
 ```
 
-数据来自宿主同源接口：`/doubao/status`、`/doubao/check`、`/doubao/account/enable|remove`。
+数据来自宿主同源接口（双前缀，`/api/doubao/*` 与 `/doubao/*` 等价）：
+`/api/doubao/status`、`/api/doubao/check`、`/api/doubao/account/add|enable|remove`。
 
 ## 本地面板
 
@@ -134,8 +135,9 @@ node tools/accounts.mjs export --out /tmp/backup.json
 
 ## 状态接口（插件内，需重启 DSH 后生效）
 
-- `GET  /doubao/status` — 账号池 + 今日用量 + 会话数
+- `GET  /doubao/status`（或 `/api/doubao/status`）— 账号池 + 今日用量 + 会话数
 - `POST /doubao/check` — 逐账号健康检查
+- `POST /doubao/account/add|enable|remove` — 账号增删启停
 
 ## 多轮上下文（contextReuse）
 
