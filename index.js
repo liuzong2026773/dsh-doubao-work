@@ -10,7 +10,7 @@
 
 import Schema from '@deepseek-ai/schemastery';
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm';
-import { DoubaoClient, DoubaoError, BUILTIN_MODELS } from './doubao.js';
+import { DoubaoClient, DoubaoError, BUILTIN_MODELS, conversationKey } from './doubao.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -48,6 +48,27 @@ export const Config = Schema.object({
   reasoningEffort: Schema.number().description('推理档位 0-3。0=真流式（推荐，边生成边到达）；1-3=先推理完再整段返回，质量更高但没有流式体感').min(0).max(3).default(0),
   contextReuse: Schema.boolean().description('复用豆包会话做多轮上下文（只在历史严格追加时复用，实测有效）').default(true),
   conversationTtlSec: Schema.number().description('会话复用有效期（秒），超时后新建会话').min(60).default(1800),
+
+  // ---- 以下为上游/运行时参数：doubao.js 会读取，此前未在 Schema 声明，
+  //      导致配置面板无法修改、README 承诺的 baseUrl 替换实际做不到 ----
+  baseUrl: Schema.string().description('上游站点地址（默认豆包网页版；自测/自建镜像时替换）').default('https://www.doubao.com'),
+  requestTimeoutMs: Schema.number().description('单次上游请求超时（毫秒）').min(1000).default(180000),
+  globalMaxConcurrency: Schema.number().description('全局并发上限（避免同时打爆同一账号）').min(1).max(16).default(2),
+  queueWaitMs: Schema.number().description('并发排队最长等待（毫秒），超时按限流报错').min(0).default(30000),
+  dailyQuota: Schema.number().description('单账号每日额度估算基数（周一翻倍，仅用于面板推算，非官方数字）').min(1).default(200),
+  adminToken: Schema.string().description('跨机管理令牌：仅在非本机访问管理接口时需要，留空则只允许本机调用').default(''),
+  upstream: Schema.object({
+    aid: Schema.string().description('应用 ID').default('497858'),
+    device_id: Schema.string().description('设备 ID').default('7707509248230065699'),
+    web_id: Schema.string().description('web_id').default('7707509253662393906'),
+    tea_uuid: Schema.string().description('tea_uuid（空则回退 web_id）').default(''),
+    fp: Schema.string().description('浏览器指纹 fp').default('verify_mwehdj77_p7te0LWd_xEFZ_4N2S_8jDq_L7Zl4uO5iI5F'),
+    pc_version: Schema.string().description('PC 版本号').default('3.45.5'),
+    version_code: Schema.string().description('version_code').default('20800'),
+    region: Schema.string().description('区域').default('CN'),
+    language: Schema.string().description('语言').default('zh'),
+    tz_name: Schema.string().description('时区名').default('Asia/Shanghai'),
+  }).description('上游设备参数（默认值取自实测抓包，通常无需改动）'),
 });
 
 // ---------------- OpenAI Message → 豆包文本 ----------------
@@ -168,14 +189,28 @@ export class DoubaoLlmAdapter extends LlmAdapter {
     const msgs = options.messages || [];
     const firstUser = msgs.find(m => m.role === 'user');
     const firstText = firstUser ? blockText(firstUser.content) : '';
-    const convKey = firstText ? model + '|' + firstText.slice(0, 200) : '';
+    // 键用全文指纹而非前 200 字，避免开头相同的两个会话共用同一条上游会话（串号）
+    const convKey = conversationKey(model, firstText);
     // 上一条 assistant 消息（用于校验"确实是同一段对话"）
     const prevReply = msgs.length >= 2 && msgs[msgs.length - 2]?.role === 'assistant'
       ? blockText(msgs[msgs.length - 2].content) : '';
-    const reuseId = client.reusableConversation(convKey, msgs.length, prevReply);
+    // 复用上游会话：只补发上次之后的新消息。宿主每轮会重排/重注入消息，条数常常跳变，
+    // 旧实现要求「严格 +1 条」否则整段重开，表现为「每个对话都是新对话」。
+    const plan = client.planReuse(convKey, msgs, prevReply);
+    const reuseId = plan ? plan.conversationId : '';
+    const tailMsgs = plan ? msgs.slice(plan.fromIndex) : msgs;
+    const tailText = tailMsgs.map(m => blockText(m.content)).join('\n\n');
+    const reuseOk = !!(reuseId && tailText.trim());
     const lastMsg = msgs[msgs.length - 1];
     const lastText = lastMsg ? blockText(lastMsg.content) : '';
-    const text = reuseId && lastText ? lastText : messagesToText(options);
+    const text = reuseOk ? tailText : messagesToText(options);
+    // 留痕给 /doubao/status：本轮到底复用没复用、从第几条开始发
+    client.lastReuse = {
+      reused: reuseOk,
+      fromIndex: plan ? plan.fromIndex : -1,
+      total: msgs.length,
+      at: Date.now(),
+    };
     if (options.tools?.length) {
       log('warn', `豆包工作接口不支持工具调用（本次请求带 ${options.tools.length} 个工具，已忽略）。该模型适合对话/写作类任务，不适合做 Agent 主循环模型。`);
     }
@@ -211,7 +246,9 @@ export class DoubaoLlmAdapter extends LlmAdapter {
     if (result?.conversationId) client.rememberConversation(convKey, result.conversationId, msgs.length, full);
 
     yield { type: 'block-end', index: 0, block: { type: 'text', text: full } };
-    const tokens = { inputTokens: estimateTokens(text), outputTokens: estimateTokens(full) };
+    // 复用会话时本次只发最后一条，但上游计费覆盖整段上下文，按全量估算更贴近真实消耗
+    const ctxText = msgs.map(m => blockText(m.content)).join('\n') + (options.system || '');
+    const tokens = { inputTokens: estimateTokens(ctxText || text), outputTokens: estimateTokens(full) };
     yield {
       type: 'usage',
       usage: { ...tokens, totalTokens: tokens.inputTokens + tokens.outputTokens },
@@ -288,6 +325,10 @@ export function apply(ctx, config) {
             },
             conversations: client.convMap.size,
             contextReuse: config.contextReuse !== false,
+            // 诊断字段：宿主最近一次实际下发的模型名 + 会话复用情况
+            lastModel: client.lastModel || '',
+            lastModelAt: client.lastModelAt || 0,
+            lastReuse: client.lastReuse || null,
           }, null, 2);
           res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
           res.end(body);
@@ -320,13 +361,30 @@ export function apply(ctx, config) {
        * 浏览器发起的跨源 POST 一定带 Origin；同源请求与命令行（curl / 运维脚本）没有。
        * 插件接口能增删账号、写文件，挡掉"任意网页访问本机插件口"这一类 CSRF。
        */
+      /** 回环地址判定（含 IPv4-mapped IPv6 写法） */
+      const isLoopback = (req) => {
+        const a = String(req.socket?.remoteAddress || '');
+        return a === '127.0.0.1' || a === '::1' || a === '::ffff:127.0.0.1';
+      };
       const sameOrigin = (req) => {
         const origin = req.headers?.origin;
-        if (!origin) return true;
-        try {
-          const host = String(req.headers?.host || '').replace(/^https?:\/\//, '');
-          return new URL(origin).host === host;
-        } catch (e) { return false; }
+        if (origin) {
+          try {
+            const host = String(req.headers?.host || '').replace(/^https?:\/\//, '');
+            return new URL(origin).host === host;
+          } catch (e) { return false; }
+        }
+        // 没有 Origin 的不等于可信：只放行本机回环，跨机必须带上 adminToken。
+        // 此前这里直接 return true，等于只防住浏览器，任意本地进程都能增删账号。
+        if (isLoopback(req)) return true;
+        const need = String(config.adminToken || '').trim();
+        if (!need) return false;
+        const got = String(req.headers?.['x-doubao-admin-token'] || '').trim();
+        // 等长后逐字节异或比较，避免按前缀提前返回泄露令牌
+        if (got.length !== need.length) return false;
+        let diff = 0;
+        for (let i = 0; i < need.length; i++) diff |= need.charCodeAt(i) ^ got.charCodeAt(i);
+        return diff === 0;
       };
       const json = (res, code, obj) => {
         res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' });
@@ -334,7 +392,10 @@ export function apply(ctx, config) {
       };
       const guard = (req, res) => {
         if (sameOrigin(req)) return false;
-        json(res, 403, { error: '已拒绝跨源请求（Origin 与 Host 不一致）' });
+        json(res, 403, {
+          error: '已拒绝请求：跨源访问，或非本机且未携带有效 x-doubao-admin-token。'
+            + '本机（127.0.0.1）调用与同源浏览器请求不受影响。',
+        });
         return true;
       };
       const ID_RE = /^[A-Za-z0-9_.\u4e00-\u9fa5-]{1,64}$/;
@@ -440,6 +501,50 @@ export function apply(ctx, config) {
           }
         },
       });
+      register({
+        kind: 'exact',
+        path: '/doubao/checkin',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = await parseBody(req);
+          if (!body) return json(res, 400, { error: '请求体不是合法 JSON' });
+          const id = typeof body.id === 'string' ? body.id.trim() : '';
+          if (id && !ID_RE.test(id)) return json(res, 400, { error: 'id 非法' });
+          if (id && !client.allAccounts().some(a => a.id === id)) return json(res, 404, { error: 'not found', id });
+          try {
+            const results = await client.checkinAll({ id });
+            const summary = {
+              total: results.length,
+              ok: results.filter(r => r.result === 'ok').length,
+              already: results.filter(r => r.result === 'already').length,
+              skipped: results.filter(r => r.result === 'skipped').length,
+              failed: results.filter(r => r.result === 'failed' || r.result === 'error').length,
+            };
+            json(res, 200, { summary, results });
+          } catch (e) {
+            json(res, 500, { error: e.message });
+          }
+        },
+      });
+      register({
+        kind: 'exact',
+        path: '/doubao/checkin/status',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = await parseBody(req);
+          if (!body) return json(res, 400, { error: '请求体不是合法 JSON' });
+          const id = typeof body.id === 'string' ? body.id.trim() : '';
+          if (!id || !ID_RE.test(id)) return json(res, 400, { error: 'id 必填且需合法' });
+          const acc = client.allAccounts().find(a => a.id === id);
+          if (!acc) return json(res, 404, { error: 'not found', id });
+          try {
+            const status = await client.getCheckinStatus(acc);
+            json(res, 200, { id, ...status });
+          } catch (e) {
+            json(res, 500, { error: e.message });
+          }
+        },
+      });
       // /api 前缀别名：部分宿主只把 /api/* 派发给插件
       web.register({
         kind: 'prefix',
@@ -497,8 +602,14 @@ export function apply(ctx, config) {
     }
   } catch (e) { log('warn', '状态接口兜底注册失败：' + e.message); }
 
-  // 进程退出时落盘状态
-  const flush = () => client.flushState();
-  process.once('exit', flush);
-  process.once('SIGINT', () => { flush(); process.exit(0); });
+  // 进程退出时落盘状态。
+  // 不再接管 SIGINT：插件无权替宿主决定 Ctrl+C 的行为（此前 flush 后直接 process.exit(0)，
+  // 等于插件替 DSH 强杀进程），且每次 apply 都注册会让监听器在热重载时累积。
+  if (!globalThis.__dshDoubaoFlushers) {
+    globalThis.__dshDoubaoFlushers = new Set();
+    process.once('exit', () => {
+      for (const f of globalThis.__dshDoubaoFlushers) { try { f(); } catch (e) { /* ignore */ } }
+    });
+  }
+  globalThis.__dshDoubaoFlushers.add(() => client.flushState());
 }
