@@ -83,7 +83,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.5.2';
+export const VERSION = '1.5.3';
 
 /**
  * 配置默认值。

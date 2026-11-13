@@ -241,7 +241,7 @@ dsh-doubao-work/
 
 ```bash
 node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/浏览器导入(CDP)/登录助手/自动导入/模型 key 抓取/签到/账号包/数据目录/模型选择/错误码/流协议，共 119 项
-node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到/key 验证/流内报错，共 22 项
+node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到/key 验证/流内报错/活动下线，共 23 项
 node tests/standalone.mjs # 真启动 standalone 网关（临时目录 + 假上游）：OpenAI 形状/流式/白名单/会话复用，9 项
 ELECTRON_RUN_AS_NODE=1 "<安装目录>/DeepSeek Harness.exe" tests/browser-live.mjs
                           # 真开浏览器 + 本地假登录页，验证登录助手真的能点开弹窗/填号/发码/登录，6 项
@@ -401,6 +401,19 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 
 ## 更新记录
 
+- **1.5.3**（2026-11-14，签到活动下线的实证 + 抓包工具）：
+  - **签到为什么一直失败，终于有服务端原话了**：接进电脑版豆包自带的 webview 后抓到
+    `POST /alice/ug/campaign/v3/detail/ {"campaign_group_code":"pc_incentive_task_mvp_v3"}`
+    → `{"data":null,"code":2,"message":"campaign not found"}`，
+    同时 `/alice/ug/campaign/landing/get` 返回的页面配置是空的（`buttons:[]`、`content:""`）。
+    结论：这不是账号资格问题、不是代理问题、也不是本插件的实现问题——**限时活动在 0 点下线了**，
+    客户端里那一页自然渲染不出内容（"该页面暂时不可用"），签到接口也就一律 `710010702`。
+    插件现在把这个错误说成人话：「活动当前未开放（服务端 campaign not found，多为限时活动已下线）」。
+  - **新增 `tools/start-doubao-debug.cmd`**：用 `--remote-debugging-port=9222` 启动电脑版豆包
+    （只在 127.0.0.1 开调试口，不走代理、不改系统设置），配合 `tools/capture-app.mjs` 抓客户端内的接口。
+  - **`tools/capture-app.mjs` 重写**：先等调试端口出现（豆包可能还没启动），再**动态挂上之后才打开的页面**
+    ——签到页是点进「免费用豆包工作」时才创建的 webview，不等它出现就抓不到。
+- **1.5.2**
 - **1.5.2**（2026-11-14，签到真相 + 伪装客户端打开签到页）：
   - **查清了「签到失败」到底是谁的问题**：接进电脑版豆包（Chromium 147，`--remote-debugging-port=9222`）后，
     在它自带的 webview 里点「立即签到」，服务器返回的仍是 `710010702 系统错误`——和插件发的一模一样，

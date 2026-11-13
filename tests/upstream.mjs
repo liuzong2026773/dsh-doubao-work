@@ -24,12 +24,12 @@ const upstream = {
   /** probeModelKey 用：非空时假装服务端把 key 换成了这个值 */
   ackKeyOverride: '',
   // 活动/签到接口可控项
-  campaign: { checkedIn: false, detailCode: 0, detailHttp: 200, checkinCode: 0 },
+  campaign: { checkedIn: false, detailCode: 0, detailHttp: 200, checkinCode: 0, detailMsg: 'detail 异常' },
 };
 
 /** 重置签到可控项 */
 function resetCampaign(over = {}) {
-  upstream.campaign = { checkedIn: false, detailCode: 0, detailHttp: 200, checkinCode: 0, ...over };
+  upstream.campaign = { checkedIn: false, detailCode: 0, detailHttp: 200, checkinCode: 0, detailMsg: 'detail 异常', ...over };
 }
 const campaignHits = () => upstream.hits.filter(p => p.startsWith('/alice/ug/campaign'));
 
@@ -53,7 +53,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(c.detailHttp, { 'content-type': 'application/json' });
     res.end(JSON.stringify(c.detailCode === 0
       ? { code: 0, data: { tasks: [{ daily_checkin: { checked_in_today: c.checkedIn, reward: '200 额度' } }] } }
-      : { code: c.detailCode, message: 'detail 异常' }));
+      : { code: c.detailCode, message: c.detailMsg }));
     return;
   }
   if (url.pathname === '/alice/ug/campaign/landing/checkin') {
@@ -330,6 +330,14 @@ await ok('活动配置在服务端没了（detail code=1）：判 unavailable，
   assert.equal(r.result, 'unavailable');
   assert.match(r.error, /暂不可用/);
   assert.equal(campaignHits().slice(before).filter(p => p.endsWith('/landing/checkin')).length, 0, '活动不可用时不该再打签到接口');
+});
+
+await ok('活动已下线（campaign not found）：判 unavailable 且提示"未开放"', async () => {
+  resetCampaign({ detailCode: 2, detailMsg: 'campaign not found' });
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.checkin(acc('a1', COOKIE_A));
+  assert.equal(r.result, 'unavailable');
+  assert.match(r.error, /未开放|campaign/i);
 });
 
 await ok('登录态失效：标 authError 并在汇总里记 error', async () => {

@@ -422,14 +422,18 @@ export class DoubaoClient {
     if (http === 401 || (data && data.code === 401)) throw new DoubaoError('auth', '签到状态查询：登录态失效');
     if (!data || data.code !== 0) {
       const code = data && data.code !== undefined ? data.code : http;
-      // code=1 invalid param / 数据为空：活动配置在服务端没了（跨天重置、活动下线、接口变更都会这样），
-      // 此时豆包客户端里那一页同样打不开，不是本插件的问题，如实回报即可。
+      const serverMsg = String((data && (data.message || data.msg)) || '').trim();
+      // code=2 / campaign not found：活动被官方下线（限时活动到期最常见），不是账号问题，
+      // 也不是本插件的实现问题——豆包客户端里那一页此时同样打不开。
+      const gone = code === 2 || /not\s*found/i.test(serverMsg);
       return {
         checkedInToday: false,
         reward: null,
         available: false,
         code,
-        reason: `活动接口暂不可用（code=${code} ${(data && (data.message || data.msg)) || ''}）`.trim(),
+        reason: gone
+          ? '活动当前未开放（服务端 campaign not found，多为限时活动已下线），等官方重新上线后再签'
+          : `活动接口暂不可用（code=${code} ${serverMsg}）`.trim(),
       };
     }
     const tasks = Array.isArray(data.data && data.data.tasks) ? data.data.tasks : [];
