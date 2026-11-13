@@ -130,7 +130,10 @@ class DoubaoLlmAdapter extends LlmAdapter {
     const firstUser = msgs.find(m => m.role === 'user');
     const firstText = firstUser ? blockText(firstUser.content) : '';
     const convKey = firstText ? model + '|' + firstText.slice(0, 200) : '';
-    const reuseId = client.reusableConversation(convKey, msgs.length);
+    // 上一条 assistant 消息（用于校验"确实是同一段对话"）
+    const prevReply = msgs.length >= 2 && msgs[msgs.length - 2]?.role === 'assistant'
+      ? blockText(msgs[msgs.length - 2].content) : '';
+    const reuseId = client.reusableConversation(convKey, msgs.length, prevReply);
     const lastMsg = msgs[msgs.length - 1];
     const lastText = lastMsg ? blockText(lastMsg.content) : '';
     const text = reuseId && lastText ? lastText : messagesToText(options);
@@ -168,7 +171,7 @@ class DoubaoLlmAdapter extends LlmAdapter {
     }
 
     // 记住服务端分配的会话号，供下一轮复用
-    if (result?.conversationId) client.rememberConversation(convKey, result.conversationId, msgs.length);
+    if (result?.conversationId) client.rememberConversation(convKey, result.conversationId, msgs.length, full);
 
     yield { type: 'block-end', index: 0, block: { type: 'text', text: full } };
     yield {
@@ -209,14 +212,24 @@ export function apply(ctx, config) {
   // GET  /doubao/status  → 账号池 + 今日用量 + 会话数
   // POST /doubao/check   → 逐个账号做健康检查
   let statusRoutesRegistered = false;
+  let statusRouteDisposers = [];
 
-  /** 拿到 webServer 才注册；重复调用安全 */
+  /**
+   * 拿到 webServer 才注册；重复调用安全。
+   * 同时挂两个前缀：/doubao/*（精确）与 /api/doubao/*（部分宿主只派发 /api）。
+   */
   const registerStatusRoutes = (web) => {
     if (statusRoutesRegistered) return;
     if (!web || typeof web.register !== 'function') return;
     statusRoutesRegistered = true;
     try {
-      web.register({
+      const rawRegister = (r) => web.register(r);
+      const handlersByPath = {};
+      const register = (r) => {
+        if (r.kind === 'exact') handlersByPath[r.path] = r.handler;
+        return rawRegister(r);
+      };
+      register({
         kind: 'exact',
         path: '/doubao/status',
         handler: (req, res) => {
@@ -255,7 +268,7 @@ export function apply(ctx, config) {
         req.on('end', () => resolve(b));
       });
 
-      web.register({
+      register({
         kind: 'exact',
         path: '/doubao/account/enable',
         handler: async (req, res) => {
@@ -269,7 +282,7 @@ export function apply(ctx, config) {
           res.end(JSON.stringify({ ok: true }));
         },
       });
-      web.register({
+      register({
         kind: 'exact',
         path: '/doubao/account/add',
         handler: async (req, res) => {
@@ -292,7 +305,7 @@ export function apply(ctx, config) {
         },
       });
 
-      web.register({
+      register({
         kind: 'exact',
         path: '/doubao/account/remove',
         handler: async (req, res) => {
@@ -303,7 +316,7 @@ export function apply(ctx, config) {
         },
       });
 
-      web.register({
+      register({
         kind: 'exact',
         path: '/doubao/check',
         handler: async (req, res) => {
@@ -317,7 +330,23 @@ export function apply(ctx, config) {
           }
         },
       });
-      log('info', '状态接口已注册：GET /doubao/status  POST /doubao/check');
+      // /api 前缀别名：部分宿主只把 /api/* 派发给插件
+      web.register({
+        kind: 'prefix',
+        path: '/api/doubao',
+        handler: (req, res) => {
+          const u = new URL(req.url, 'http://localhost');
+          const rest = u.pathname.replace(/^\/api\/doubao/, '');
+          const target = '/doubao' + (rest || '/status');
+          const h = handlersByPath[target];
+          if (!h) {
+            res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' });
+            return res.end(JSON.stringify({ error: 'not found', path: u.pathname }));
+          }
+          return h(req, res);
+        },
+      });
+      log('info', '状态接口已注册：/doubao/* 与 /api/doubao/*');
     } catch (e) {
       statusRoutesRegistered = false;
       log('warn', '状态接口注册失败：' + e.message);
