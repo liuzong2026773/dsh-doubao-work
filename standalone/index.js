@@ -338,7 +338,9 @@ async function pumpDoubaoStream(webStream, onDelta, signal) {
     if (ended) break;
   }
   try { await reader.cancel(); } catch (e) { /* ignore */ }
-  return full;
+  // ended=false 表示没收到 SSE_REPLY_END 就断流（网络抖动 / 上游掐线），
+  // 此时 full 只是半截内容，必须告知调用方，否则客户端会把半截当成完整回复。
+  return { text: full, truncated: !ended && full.length > 0 };
 }
 
 // ---------------- OpenAI 层 ----------------
@@ -403,7 +405,7 @@ async function handleChatCompletions(req, res) {
       const up = await upstreamChat(acc, modelItemKey, text, abort.signal);
       if (up.ok) {
         log('info', `上游 200 账号=${acc.id} 模型=${model}`, { acc: acc.id });
-        const fullText = await pumpDoubaoStream(up.stream, chunk => {
+        const out = await pumpDoubaoStream(up.stream, chunk => {
           if (!wantStream) return;
           const payload = {
             id: 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24),
@@ -414,6 +416,8 @@ async function handleChatCompletions(req, res) {
           };
           res.write(`data: ${JSON.stringify(payload)}\n\n`);
         }, abort.signal);
+        const fullText = out.text;
+        if (out.truncated) log('warn', `上游流中断，仅返回部分内容（${fullText.length} 字）`);
 
         const ms = Date.now() - startedAt;
         accState(acc.id).totalChars += fullText.length;
@@ -421,7 +425,7 @@ async function handleChatCompletions(req, res) {
         log('info', `完成 账号=${acc.id} 模型=${model} 字数=${fullText.length} 耗时=${ms}ms`, { acc: acc.id, ms, chars: fullText.length });
 
         if (wantStream) {
-          const fin = { id: 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24), object: 'chat.completion.chunk', created: Math.floor(startedAt / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] };
+          const fin = { id: 'chatcmpl-' + uuid().replace(/-/g, '').slice(0, 24), object: 'chat.completion.chunk', created: Math.floor(startedAt / 1000), model, choices: [{ index: 0, delta: {}, finish_reason: out.truncated ? 'length' : 'stop' }] };
           res.write(`data: ${JSON.stringify(fin)}\n\n`);
           res.write('data: [DONE]\n\n');
           res.end();
@@ -432,7 +436,7 @@ async function handleChatCompletions(req, res) {
             object: 'chat.completion',
             created: Math.floor(startedAt / 1000),
             model,
-            choices: [{ index: 0, message: { role: 'assistant', content: fullText }, finish_reason: 'stop' }],
+            choices: [{ index: 0, message: { role: 'assistant', content: fullText }, finish_reason: out.truncated ? 'length' : 'stop' }],
             usage: { prompt_tokens: estimateTokens(text), completion_tokens: estimateTokens(fullText), total_tokens: estimateTokens(text) + estimateTokens(fullText) },
           });
         }
