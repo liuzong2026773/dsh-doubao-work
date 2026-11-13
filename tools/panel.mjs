@@ -71,13 +71,17 @@ pre{background:#111;color:#ddd;padding:12px;border-radius:8px;overflow:auto;max-
 <div class="cards" id="cards"></div>
 <div class="bar">
   <button onclick="load()">刷新</button>
-  <button onclick="check()">健康检查</button>
+  <button onclick="check()">健康检查</button><button onclick="checkin()">一键签到</button>
 </div>
 <table><thead><tr><th>账号</th><th>状态</th><th>今日请求</th><th>预估剩余</th><th>累计字数</th><th>最近错误</th><th>操作</th></tr></thead><tbody id="rows"></tbody></table>
 <pre id="log">就绪</pre>
 <script>
 const el=id=>document.getElementById(id);
-const esc=s=>String(s??'').replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+// 把任意值安全地嵌进内联 onclick：先转成 JS 字符串字面量（会带引号并转义内部字符），
+// 再做 HTML 属性转义。直接拼 esc(a.id) 不行 —— esc 把 ' 转成 &#39;，浏览器解析属性时
+// 又还原成 '，照样能跳出 JS 字符串。
+const jsLit=s=>esc(JSON.stringify(String(s??'')));
 async function load(){
   try{
     const d=await (await fetch('/api/status')).json();
@@ -86,13 +90,21 @@ async function load(){
       ['账号',d.summary.accounts],['可用',d.summary.usable],
       ['今日请求',d.summary.todayReq],['预估剩余',d.summary.quotaLeftEst]
     ].map(([k,v])=>'<div class="card"><span>'+k+'</span><b>'+v+'</b></div>').join('');
-    el('rows').innerHTML=d.accounts.map(a=>'<tr><td>'+esc(a.remark||a.id)+'</td><td class="'+(a.status==='可用'?'ok':(a.status.includes('失效')?'err':'warn'))+'">'+esc(a.status)+'</td><td>'+a.todayReq+'</td><td>'+a.quotaLeftEst+'</td><td>'+a.totalChars+'</td><td>'+esc(a.lastError||'-')+'</td><td><button onclick="toggle(\''+a.id+'\','+(a.status!=='已停用')+')">'+(a.enabled?'停用':'启用')+'</button><button onclick="del(\''+a.id+'\')">删除</button></td></tr>').join('');
+    el('rows').innerHTML=d.accounts.map(a=>'<tr><td>'+esc(a.remark||a.id)+'</td><td class="'+(a.status==='可用'?'ok':(a.status.includes('失效')?'err':'warn'))+'">'+esc(a.status)+'</td><td>'+a.todayReq+'</td><td>'+a.quotaLeftEst+'</td><td>'+a.totalChars+'</td><td>'+esc(a.lastError||'-')+'</td><td><button onclick="toggle('+jsLit(a.id)+','+(a.status!=='已停用')+')">'+(a.enabled?'停用':'启用')+'</button><button onclick="del('+jsLit(a.id)+')">删除</button></td></tr>').join('');
   }catch(e){el('log').textContent='加载失败: '+e.message}
 }
 async function check(){
   el('log').textContent='检查中…';
   const d=await (await fetch('/api/check',{method:'POST'})).json();
   el('log').textContent=JSON.stringify(d.results,null,2);
+  load();
+}
+async function checkin(){
+  el('log').textContent='签到中…';
+  try{
+    const d=await (await fetch('/api/checkin',{method:'POST',headers:{'content-type':'application/json'},body:'{}'})).json();
+    el('log').textContent=JSON.stringify(d,null,2);
+  }catch(e){el('log').textContent='签到失败: '+e.message}
   load();
 }
 async function toggle(id,on){
@@ -110,6 +122,18 @@ load();setInterval(load,15000);
 const server = http.createServer(async (req, res) => {
   const url = new URL(req.url, 'http://localhost');
   const p = url.pathname;
+  // 面板能增删账号、改上游状态，写接口必须挡跨源：
+  // 此前写接口没有任何同源校验，任意网页都能对本机 3041 端口发 POST，等于把账号池交给任意站点。
+  if (req.method === 'POST') {
+    const origin = req.headers.origin;
+    const remote = String(req.socket?.remoteAddress || '');
+    const loopback = remote === '127.0.0.1' || remote === '::1' || remote === '::ffff:127.0.0.1';
+    let ok = loopback;
+    if (origin) {
+      try { ok = new URL(origin).host === String(req.headers.host || ''); } catch (e) { ok = false; }
+    }
+    if (!ok) return json(res, 403, { error: '已拒绝：跨源或非本机请求' });
+  }
   try {
     if (p === '/') {
       res.writeHead(200, { 'content-type': 'text/html; charset=utf-8' });
@@ -122,7 +146,7 @@ const server = http.createServer(async (req, res) => {
         models: c.models().map(m => m.id),
         accounts: snap,
         conversations: c.convMap.size,
-        contextReuse: true,
+        contextReuse: c.cfg.contextReuse !== false,
         summary: {
           accounts: snap.length,
           usable: snap.filter(a => a.status === '可用').length,
@@ -130,6 +154,29 @@ const server = http.createServer(async (req, res) => {
           quotaLeftEst: snap.reduce((s, a) => s + a.quotaLeftEst, 0),
         },
       });
+    }
+    if (p === '/api/checkin' && req.method === 'POST') {
+      const c = makeClient();
+      let id = '';
+      try {
+        id = String((JSON.parse((await readBody(req)) || '{}') || {}).id || '');
+      } catch (e) { id = ''; }
+      try {
+        const results = await c.checkinAll({ id });
+        if (typeof c.flushState === 'function') c.flushState();
+        return json(res, 200, {
+          summary: {
+            total: results.length,
+            ok: results.filter(r => r.result === 'ok').length,
+            already: results.filter(r => r.result === 'already').length,
+            skipped: results.filter(r => r.result === 'skipped').length,
+            failed: results.filter(r => r.result === 'failed' || r.result === 'error').length,
+          },
+          results,
+        });
+      } catch (e) {
+        return json(res, 500, { error: e.message });
+      }
     }
     if (p === '/api/check' && req.method === 'POST') {
       const c = makeClient();
