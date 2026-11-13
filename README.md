@@ -134,6 +134,13 @@ Application 包装层的布局也认）。想用别的内核浏览器，在插�
 - **扩展模型**：抓到新模型后，在 `extraModels` 里同时填 `modelItemKey` 和 `itemId`（网页版
   `need_deep_think` 的值），用 `node tools/capture-chat.mjs` 抓、`/doubao/models/probe` 验证
   （见「运维小工具」）
+- **图片输入（1.6.0）**：DSH 会话里发图 → 豆包真的看图回答（适配器自动上传 + 登记，实测"蓝色，横向长方形"）
+- **生图 / 生视频 / 出文件（1.6.0）**：面板「创作」区一键生成；生图回图片直链（markdown 内嵌显示），
+  生视频等出片后回 mp4 直链，PPT/Word/PDF/表格给打开链接；命令行 `tools/generate.mjs` 同能力
+- **客户端身份（1.6.0）**：带 msToken 时请求整体切到豆包 PC 客户端身份（`aid=582478` + 客户端 UA +
+  `chrome://doubao-chat/` Referer），实测网页身份被 710022004 风控拦死时客户端身份畅通
+- **msToken 自动摘取（1.6.0）**：面板「抓取 msToken」/ `tools/mstoken.mjs --harvest`，从豆包客户端的
+  请求里被动摘取并缓存，重启 DSH 也能用（存数据目录 `mstoken.json`）
 
 ## 多账号与 Cookie 导入/导出（accounts.json）
 
@@ -182,6 +189,64 @@ Application 包装层的布局也认）。想用别的内核浏览器，在插�
 2. `F12` → Network → 随便点一个请求 → Request Headers → 复制整条 `Cookie` 值
 3. 加进 `accounts.json` 的一个新条目（`id` 别重复）
 
+## 多模态：看图 / 生图 / 生视频 / 出文件（1.6.0）
+
+这四件事都走豆包**普通对话**（`agent_mode=2, mode_id=1, model_item_key=0`），不需要工作模式。
+
+**前置：豆包 PC 客户端带调试端口启动**
+
+```cmd
+tools\start-doubao-debug.cmd
+```
+
+它在 127.0.0.1:9222 开调试口（不影响豆包正常使用）。客户端开着才有两样东西：
+① msToken（客户端身份凭证，网页身份没有它会被 710022004 风控拦）② 图片上传通道（客户端有现成的
+file input，借它上传不用自己实现火山引擎签名）。
+
+**身份怎么选**：有 msToken 就走客户端（`aid=582478`、UA 带 `SamanthaDoubao/2.35.12`、
+Referer `chrome://doubao-chat/`）；没有就退回网页身份。面板「看身份」能看到当前用的哪个。
+msToken 是从客户端请求里**被动摘**的（`tools/mstoken.mjs --harvest`），自己随机编一个会被
+710022002 拒掉，因为服务端会验。
+
+**① 图片输入（DSH 发图 → 豆包看图）**
+
+在 DSH 会话里直接发图。适配器把图块抽出来（兼容 base64/url/image_url 三种形状）→
+借客户端上传成 `tos-cn-i-…` uri → 调 `pre_handle_v2_without_conv` 登记（**不登记豆包会装没看见**，
+实测踩过）→ 消息体带 `attachment_block`（block_type 10052）。上传失败不静默丢图，会在正文里注明
+"有几张没传过去、原因是什么"，让用户知道模型是在"没图"的情况下回答的。
+
+**② 生图**：消息里出现 `block_type 2074` 创作块 → 解析 `creation_block.creations[].image.image_ori.url`
+→ 以 markdown 图片内嵌在回复里。注意同一个创作块会先发占位（`{status,placeholder}`）再发真 URL，
+去重必须等拿到 URL 再做（第一版在这里丢过整张图）。实测 12–18 秒出图，PNG 5–6MB。
+
+**③ 生视频**：两轮协议——第一轮回"参数确认"（Seedance 2.0 Mini / 时长 / 比例），第二轮发
+「确认，开始生成」才真排队；然后 mp4 **不在这条 SSE 里**，是之后以普通消息形式到达。所以
+`generateVideo()` 会轮询 `/alice/conversation/latest_messagelist` 直到出现
+`video.download_url`（实测 1–3 分钟，mp4 约 1.3MB）。拿不到时返回 `pending:true`，
+稍后带同一个 `conversationId` 再调即可取回。
+
+**④ 文件产出（PPT / Word / PDF / 表格）**：完成后以 `block_type 10030` 产物卡片到达，只有
+`resource_id + conversation_id + title`，**没有直链**（文件在豆包云盘/飞书文档里）。插件给
+「打开这条对话」的链接当下载入口，进去点卡片下载。直连导出接口
+（`/samantha/otter/export/page/create`）试了十余种参数组合都是 `record not found`/`params invalid`，
+该 token 只存在于云盘页面自己的会话里——如实标注为未攻克，见「待办」。
+
+**接口与工具**：
+
+```bash
+# 面板操作即可完成；命令行等价物：
+node tools/mstoken.mjs --status              # 看缓存的 token 与身份
+node tools/mstoken.mjs --harvest             # 从客户端摘新 token（客户端要开着）
+node tools/generate.mjs --kind image --prompt "画一只戴墨镜的柴犬，扁平插画" --save dog.png
+node tools/generate.mjs --kind video --prompt "生成一段 5 秒视频：海边日落" --save sea.mp4
+node tools/generate.mjs --kind file  --prompt "做一份 3 页 PPT：2026 计划"
+
+# HTTP 接口（本机）：
+curl -X POST http://127.0.0.1:<port>/doubao/generate -d '{"kind":"image","prompt":"..."}'
+curl -X POST http://127.0.0.1:<port>/doubao/image/upload -d '{"path":"C:/tmp/a.png"}'
+curl -X POST http://127.0.0.1:<port>/doubao/mstoken -d '{"action":"harvest"}'
+```
+
 ## 已知限制（如实说明）
 
 - **不支持工具调用（function calling）**：豆包对话接口没有该能力，本模型适合对话/写作/问答，**不适合当 Agent 主循环模型**
@@ -189,6 +254,13 @@ Application 包装层的布局也认）。想用别的内核浏览器，在插�
 - Cookie 会过期（数天到数周），失效后重新登录复制即可
 - 每次调用都会在豆包账号里产生一条真实对话记录
 - 属于个人自用的非官方接入方式，违反豆包用户协议的风险自担；建议小号使用、控制频率
+- **图片输入依赖豆包客户端开着**（借它的 file input 上传）。客户端不开时会在回复里明确说
+  "有几张图没传过去"，不会假装看过图
+- **msToken 会过期**（跟登录态同寿命）。过期后表现为风控变严，面板点一次「抓取 msToken」即可续
+- **文件产出没有直链**：PPT/Word/PDF/表格给的是"打开对话"的入口，下载要点豆包里的卡片
+- **生视频要等**：提交后 1–3 分钟出片，插件默认最多轮询 8 分钟（`maxWaitMs` 可调），
+  超时不代表失败，带 `conversationId` 再查一次就能取回
+- 生图/生视频的直链是带签名的临时地址（几小时到几天），要留存就尽快下载
 
 ## 目录结构
 
@@ -200,6 +272,8 @@ dsh-doubao-work/
 ├── paths.js           # 数据目录：Cookie/状态放 <dshHome>/doubao-work，升级不丢
 ├── cookie-input.js    # 粘贴解析：整段 Cookie / 请求头 / cURL / JSON / cookies.txt → 规范串
 ├── browser.js         # 从浏览器导入：探测内核、拉起调试端口、CDP 只读抓 Cookie
+├── uploader.js        # 图片上传：借豆包客户端的 file input 传到 imagex，回收 tos uri
+├── mstoken.js         # msToken 摘取/缓存（客户端身份凭证）
 ├── client.js          # 浏览器半身：设置页「豆包工作」
 ├── package.json
 ├── cordis.patch.yml
@@ -285,6 +359,13 @@ node tools/capture-chat.mjs                      # 自动发一句话，抓网�
 node tools/capture-chat.mjs --manual --wait 600  # 只观察不开火：你在窗口里切模型/发消息，它把请求体打出来
 node tools/capture-live.mjs --seconds 600        # 记录窗口里所有 /alice /biz /samantha 接口调用（排查用）
 node tools/model-probe.mjs --key <key>           # 验证某个 key 是否真生效（看 SSE_ACK 回写）
+
+node tools/mstoken.mjs --status                  # 当前身份：客户端 / 网页，缓存的 token 从哪来
+node tools/mstoken.mjs --harvest --wait 25       # 从客户端摘 msToken（客户端要带 9222 启动）
+node tools/mstoken.mjs --set <token>             # 手工塞一个（比如从别处抓的）
+node tools/generate.mjs --kind image --prompt "..." --save a.png   # 生图
+node tools/generate.mjs --kind video --prompt "..." --save a.mp4   # 生视频（两轮 + 轮询）
+node tools/generate.mjs --kind file  --prompt "..."                # 出文件（PPT/Word/PDF/表格）
 ```
 
 ## 推送代码（国内网络备选）
@@ -329,6 +410,14 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
   `{ok, mode, added, updated, skipped, total}`（按 `id` 合并，同 id 覆盖 Cookie，重复导入幂等）
 - `POST /doubao/models/probe` — 验证一个 `model_item_key` 是否真被服务端接受：`{key, id?}` →
   `{ok, echoed, key, account}`，判据是 SSE_ACK 里服务端回写的 key（不是模型自称），会消耗一次极短对话
+- `POST /doubao/generate` — 生成产出：`{prompt, kind:'image'|'video'|'file'|'any', id?, conversationId?,
+  imagePath?, pollMs?, maxWaitMs?}` → `{ok, kind, account, conversationId, text, media, all, pending, polls,
+  transport, hint}`。`imagePath` 传本地图会先上传+登记再一起发（改图/看图）；视频 `pending:true`
+  表示还在生成，带 `conversationId` 再调一次即可取回
+- `POST /doubao/image/upload` — 上传本地图片：`{path}` → `{ok, uri, identifier, preGenerateId, transport}`，
+  拿到 `uri` 就能在 `/doubao/generate` 里用
+- `POST /doubao/mstoken` — msToken 管理：`{action:'status'|'set'|'harvest'|'clear', token?, port?, wait?}` →
+  `{ok, transport, cached:{token,masked,source,ageMinutes}, ...}`；`harvest` 从豆包客户端被动摘取
 
 **访问控制**：带 `Origin` 的浏览器请求必须同源；不带 `Origin` 的调用只放行本机（`127.0.0.1` / `::1`）。
 需要从别的机器调管理接口时，在配置里设 `adminToken`，并带上请求头：
@@ -371,9 +460,13 @@ curl -X POST http://<host>:<port>/doubao/account/add \
 两套离线测试都不联网、不消耗豆包额度：
 
 ```bash
-node tests/smoke.mjs      # 插件契约 + HTTP 管理接口 + 适配器流协议
-node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
+node tests/smoke.mjs      # 插件契约 + HTTP 管理接口 + 适配器流协议（122 项）
+node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致，33 项）
 ```
+
+1.6.0 新增覆盖：带图消息体（10052 附件块 + pre_handle 登记）、图片占位块去重、产物卡片 10030 解析、
+视频轮询（latest_messagelist → `download_url`）、`extractImageParts`/`uploadImagesForRequest` 的
+失败路径（不静默丢图）。
 
 `tests/smoke.mjs` 会 `import('../index.js')`，因此需要能解析到 peer 依赖
 `@deepseek-ai/dsh-llm` 与 `@deepseek-ai/schemastery`。在本机开发时直接把 DSH 安装目录
@@ -401,6 +494,30 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 
 ## 更新记录
 
+- **1.6.0**（2026-11-14，多模态与创作产出）：
+  - **图片输入真的通了**：DSH 发图 → 借豆包客户端的 file input 上传到 imagex → 调
+    `/alice/message/pre_handle_v2_without_conv` 登记 → 消息体带 `attachment_block`（10052）。
+    实测：一张纯蓝 PNG，模型答「蓝色，横向长方形」；纯蓝 240×160，问到颜色形状全对。
+  - **上传不用自己实现火山签名**：原来卡在 veImageX（prepare_upload 发 STS → 签名 PUT → Commit），
+    后来发现客户端自己就能传，CDP 塞文件 + 从 `pre_handle` 请求里回收 `tos-cn-i-…` uri 即可。
+  - **漏登记会装看不见图**：只带 uri 不登记 pre_handle 时模型会回「我这边没有收到图片」，
+    补上登记后稳定；失败也不静默丢图，正文里注明"有几张没传过去 + 原因"。
+  - **生图**：`2074` 创作块 → `creation_block.creations[].image.image_ori.url` → markdown 内嵌。
+    占位块（无 URL）与真 URL 分两次下发，去重键改成 `id|url` 否则真图会被当重复丢掉（踩过）。
+  - **生视频**：两轮协议（提需求 → 回参数确认 → 「确认，开始生成」）+ 轮询
+    `/alice/conversation/latest_messagelist` 取 `video.download_url`。实测 5.4s 拿到确认、
+    约 2 分钟后出片，mp4 1.3–1.7MB 可下载（`ftyp` 校验通过）。超时返回 `pending:true` 可续查。
+  - **文件产出**：`10030` 产物卡片 → 解析 `resource_id/title/conversation_id`，给"打开对话"
+    当下载入口；直连导出 `/samantha/otter/export/page/create` 试了十余组参数仍 `record not found`，
+    如实标注未攻克。
+  - **客户端身份 + msToken**：网页身份被 `710022004` 风控拦死（两个号都中），换客户端身份
+    （`aid=582478`、UA `SamanthaDoubao/2.35.12`、Referer `chrome://doubao-chat/`、msToken）后畅通。
+    msToken 自己编会被 `710022002` 拒，只能从客户端被动摘；已做缓存（`mstoken.json`）+ 面板一键摘。
+  - **面板新增**：「创作」区（选生图/生视频/出文件 + 一句话 → 结果直接显示）+ 「抓取 msToken」/「看身份」。
+  - **新接口**：`/doubao/generate`、`/doubao/image/upload`、`/doubao/mstoken`；
+    新工具 `tools/generate.mjs`、`tools/mstoken.mjs`；新模块 `uploader.js`、`mstoken.js`。
+  - 测试：`smoke` 119 → **122 项**、`upstream` 27 → **33 项**，新增带图消息体、pre_handle 登记、
+    视频轮询、产物卡片、上传失败提示等用例。
 - **1.5.3**（2026-11-14，签到活动下线的实证 + 抓包工具）：
   - **签到为什么一直失败，终于有服务端原话了**：接进电脑版豆包自带的 webview 后抓到
     `POST /alice/ug/campaign/v3/detail/ {"campaign_group_code":"pc_incentive_task_mvp_v3"}`

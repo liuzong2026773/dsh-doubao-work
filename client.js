@@ -28,6 +28,12 @@ window.__ModuleLoader__.load({
       status: () => req('/api/doubao/status', { cache: 'no-store' }),
       check: () => req('/api/doubao/check', { method: 'POST' }),
       checkinOpen: (body) => req('/api/doubao/checkin/open', { method: 'POST', body }),
+      generate: (body) => req('/api/doubao/generate', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      }),
+      mstoken: (body) => req('/api/doubao/mstoken', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}),
+      }),
       checkin: (body) => req('/api/doubao/checkin', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}),
       }),
@@ -103,6 +109,10 @@ window.__ModuleLoader__.load({
       const [err, setErr] = useState('')
       const [busy, setBusy] = useState('')
       const [log, setLog] = useState('')
+      const [genPrompt, setGenPrompt] = useState('')
+      const [genKind, setGenKind] = useState('image')
+      const [genOut, setGenOut] = useState(null)
+      const [msInfo, setMsInfo] = useState(null)
       const [browser, setBrowser] = useState(null) // 从浏览器导入：{port, browser:{name}, hint}
       const [phone, setPhone] = useState('')       // 登录助手：手机号
       const [code, setCode] = useState('')         // 登录助手：短信验证码
@@ -126,6 +136,32 @@ window.__ModuleLoader__.load({
         catch (e) { setLog('失败: ' + (e.message || e)) }
         setBusy(''); load()
       }
+      // 生成：面板里点一下就能出图/出片/出文件，结果直接显示（图片渲染、文件给链接）
+      const onGenerate = async () => {
+        const prompt = genPrompt.trim()
+        if (!prompt) { setLog('先写一句要生成什么'); return }
+        setBusy('gen'); setGenOut(null)
+        setLog((genKind === 'video' ? '正在生成视频（豆包要几分钟，别关页面）…' : genKind === 'file' ? '正在生成文件（PPT/Word 通常要 2-3 分钟）…' : '正在生图…'))
+        try {
+          const r = await api.generate({ kind: genKind, prompt })
+          setGenOut(r)
+          setLog(r.hint || (r.media && r.media.length ? '好了：拿到 ' + r.media.length + ' 个产出' : '上游只回了文字'))
+        } catch (e) { setLog('生成失败：' + (e.message || e)) }
+        finally { setBusy(null) }
+      }
+
+      // msToken：客户端身份凭证。摘到之后请求走 aid=582478，风控明显更松
+      const onMsToken = async (action) => {
+        setBusy('ms')
+        try {
+          const r = await api.mstoken({ action })
+          if (action === 'status') { setMsInfo(r); return }
+          setLog(r.ok ? (action === 'harvest' ? '已摘到 msToken，现在用客户端身份' : 'msToken 已设置') : ('失败：' + (r.error || '')))
+          setMsInfo(await api.mstoken({ action: 'status' }))
+        } catch (e) { setLog('msToken 操作失败：' + (e.message || e)) }
+        finally { setBusy(null) }
+      }
+
       // 一键签到：不带 id = 全部账号；带 id = 单号。服务端按天幂等，重复点不会重复领
       const onCheckin = async (id) => {
         setBusy(id ? 'checkin-' + id : 'checkin')
@@ -407,6 +443,45 @@ window.__ModuleLoader__.load({
             ? '｜自动签到：每天 ' + data.checkinSchedule + (data.checkinNextAt ? '（下次 ' + new Date(data.checkinNextAt).toLocaleString('zh-CN') + '）' : '')
             : '｜自动签到未开启（配置 checkinSchedule: "09:30" 即可）')
           + (data.accountsPath ? '｜账号文件：' + data.accountsPath : '')),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderRadius: 10, border: '1px solid var(--dsw-alias-border-l2, #e3e6ea)' } },
+          h('div', { style: { fontWeight: 600, fontSize: 13 } }, '创作（生图 / 生视频 / 出文件）'),
+          h('div', { style: S.mute },
+            '跟豆包普通对话同一条通道：生图走 Seedream，出片走 Seedance，文件是 PPT/Word/PDF/表格。',
+            '视频和文件比较慢（1-3 分钟），点完可以放着不管。DSH 会话里直接说"画个…"也会自动走到这里。'),
+          h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' } },
+            h('select', { style: S.btn, value: genKind, onChange: e => setGenKind(e.target.value) },
+              h('option', { value: 'image' }, '生图'),
+              h('option', { value: 'video' }, '生视频'),
+              h('option', { value: 'file' }, '出文件'),
+              h('option', { value: 'any' }, '自动')),
+            h('input', {
+              placeholder: '例如：画一只戴墨镜的柴犬，扁平插画 ｜ 做一份 3 页 PPT：2026 计划',
+              value: genPrompt,
+              style: { flex: '1 1 320px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
+              onChange: e => setGenPrompt(e.target.value),
+              onKeyDown: e => { if (e.key === 'Enter' && !busy) onGenerate() },
+            }),
+            h('button', { style: S.btn, disabled: !!busy, onClick: () => onGenerate() }, busy === 'gen' ? '生成中…' : '生成')),
+          genOut && genOut.media && genOut.media.length
+            ? h('div', { style: { display: 'flex', gap: 8, flexWrap: 'wrap' } },
+              genOut.media.map((m, i) => {
+                if (m.kind === 'image') return h('img', { key: i, src: m.url, alt: '', style: { maxWidth: 220, maxHeight: 220, borderRadius: 8, border: '1px solid #d0d5dc' } })
+                if (m.kind === 'video') return h('video', { key: i, src: m.url, controls: true, style: { maxWidth: 320, borderRadius: 8 } })
+                return h('a', { key: i, href: m.url, target: '_blank', rel: 'noreferrer', style: { fontSize: 13 } }, '📄 ' + (m.name || '文件'))
+              }))
+            : (genOut ? h('div', { style: S.mute }, '这次没拿到产出：' + (genOut.hint || '上游只回了文字')) : null)),
+
+        h('div', { style: S.row },
+          h('button', { style: S.btn, disabled: !!busy, onClick: () => onMsToken('harvest') }, busy === 'ms' ? '摘取中…' : '抓取 msToken'),
+          h('button', { style: { ...S.btn, marginLeft: 6 }, disabled: !!busy, onClick: () => onMsToken('status') }, '看身份'),
+          msInfo
+            ? h('span', { style: S.mute },
+              '当前身份：' + (msInfo.transport === 'client' ? '客户端（aid=582478，风控松）' : '网页（aid=497858，容易被要求人机验证）'),
+              msInfo.cached
+                ? '｜token 已缓存 ' + msInfo.cached.ageMinutes + ' 分钟（来源 ' + (msInfo.cached.source || '?') + '）'
+                : '｜没缓存：抓一次才能用客户端身份（要在豆包 PC 客户端带调试端口启动）')
+            : null),
+
         log ? h('pre', { style: S.pre }, log) : null)
     }
 

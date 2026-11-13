@@ -21,6 +21,8 @@ const upstream = {
   defaultBehavior: 'ok',
   bodies: [],
   hits: [],
+  /** 图片登记（pre_handle_v2_without_conv）收到的请求体 */
+  preHandles: [],
   /** probeModelKey 用：非空时假装服务端把 key 换成了这个值 */
   ackKeyOverride: '',
   // 活动/签到接口可控项
@@ -64,6 +66,42 @@ const server = http.createServer((req, res) => {
       : { code: c.checkinCode, message: '不满足签到条件' }));
     return;
   }
+  if (url.pathname === '/alice/conversation/latest_messagelist') {
+    const videoMsg = {
+      message_id: 'm-video-1',
+      index: 9,
+      content: JSON.stringify([{
+        block_type: 2074,
+        content: { creation_block: { creations: [{
+          type: 2, id: 'cr-video-1', gen_detail: { task_type: 6 },
+          video: {
+            vid: 'v0269test', download_url: 'https://x.test/video.mp4?sig=1\\u0026x=2',
+            duration: 5.057, width: 384, height: 216, video_type: 'mp4', status: 3,
+            cover: { image_thumb: { url: 'https://x.test/cover.png' } },
+          },
+        }] } },
+      }]),
+    };
+    upstream.hits.push(url.pathname);
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ code: 0, msg: '', data: { message_map: { 'conv-test-1': [videoMsg] } } }));
+    return;
+  }
+
+  // 图片登记：registerImages 会调它（自己收 body，因为要赶在下面的 404 卫兵之前返回）
+  if (url.pathname === '/alice/message/pre_handle_v2_without_conv') {
+    let regRaw = '';
+    req.on('data', (c) => { regRaw += c; });
+    req.on('end', () => {
+      let parsed = {};
+      try { parsed = JSON.parse(regRaw); } catch { /* 空 body 就算了 */ }
+      upstream.preHandles.push(parsed);
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ code: 0, msg: '', data: { pre_generate_id: 'pg-test-1' } }));
+    });
+    return;
+  }
+
   if (url.pathname !== '/chat/completion') {
     res.writeHead(404).end();
     return;
@@ -117,6 +155,30 @@ const server = http.createServer((req, res) => {
         error_code: 710022004, error_msg: 'rate limited',
         extra: { decision: JSON.stringify({ code: '10000', type: 'verify', subtype: 'semantic_reasoning', verify_scene: 'doubao_message_web' }) },
       });
+      sse(res, 'SSE_REPLY_END', { end_type: 3 });
+      res.end();
+      return;
+    }
+
+    if (mode === 'artifact') {
+      // 真实产物卡片：只有 resource_id + conversation_id，没有直链；status 会从"制作中"变"完成"
+      const card = (title, status) => ({ patch_op: [{ patch_object: 1, patch_value: { content_block: [{ block_type: 10030, content: { artifact_block: { resource_id: 'res-1', conversation_id: 'conv-9', title, status, resource_content_type: 'type/sxsd', brief_image: { image_thumb: { url: 'https://x.test/prev.png?a=1\\u0026b=2' } } } } }] } }] });
+      sse(res, 'STREAM_CHUNK', card('季度计划（制作中）', 2));
+      sse(res, 'STREAM_CHUNK', { patch_op: [{ patch_object: 1, patch_value: { content_block: [{ block_type: 10000, content: { text_block: { text: 'PPT 已做好。' } } }] } }] });
+      sse(res, 'STREAM_CHUNK', card('季度计划', 3));
+      sse(res, 'SSE_REPLY_END', { end_type: 3 });
+      res.end();
+      return;
+    }
+
+    if (mode === 'media') {
+      // 真实生图下发顺序：占位创作块（没有 URL）→ 文本 → 同一个 id 补上 image_ori URL
+      const blk = (creations) => ({ patch_op: [{ patch_object: 1, patch_value: { content_block: [{ block_type: 2074, content: { creation_block: { creations } } }] } }] });
+      sse(res, 'STREAM_CHUNK', blk([{ type: 1, id: 'cr-1', image: { status: 2, placeholder: true } }]));
+      sse(res, 'STREAM_CHUNK', { patch_op: [{ patch_object: 1, patch_value: { content_block: [{ block_type: 10000, content: { text_block: { text: '已生成。' } } }] } }] });
+      sse(res, 'STREAM_CHUNK', blk([{ type: 1, id: 'cr-1', image: { status: 3, image_ori: { url: 'https://x.test/a.jpeg\\u0026sig=1' }, image_thumb: { url: 'https://x.test/a-thumb.png' } } }]));
+      // 同一张图再重复下发一次：去重要起作用
+      sse(res, 'STREAM_CHUNK', blk([{ type: 1, id: 'cr-1', image: { status: 3, image_ori: { url: 'https://x.test/a.jpeg\\u0026sig=1' } } }]));
       sse(res, 'SSE_REPLY_END', { end_type: 3 });
       res.end();
       return;
@@ -413,6 +475,132 @@ await ok('上游收到的请求带 need_deep_think=10001（模型才真的切过
   assert.equal(sent.option.need_deep_think, 10001);
   assert.equal(sent.option.conversation_init_ext.model_item_key, 'person-deepseek-v4-1-flash-261017');
   assert.equal(sent.option.model_config.model_extra_params.memory_profile, '300k_230');
+});
+
+await ok('generate()：普通对话模式（agent_mode=2 / mode_id=1 / 不带 conversation_mode）', async () => {
+  upstream.defaultBehavior = 'media';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const before = upstream.bodies.length;
+  const r = await c.generate('画一只猫', { id: 'a1' });
+  const sent = upstream.bodies.slice(before).find(b => b && b.option);
+  assert.equal(sent.option.agent_mode, 2, '生图应走普通对话的 agent_mode');
+  assert.equal(sent.option.conversation_init_ext.mode_id, '1');
+  assert.equal(sent.option.conversation_init_ext.model_item_key, '0');
+  assert.equal(sent.option.need_deep_think, 0);
+  assert.ok(!('conversation_mode' in sent.option), '普通对话不该带 conversation_mode=2');
+  assert.equal(r.text.includes('已生成。'), true);
+});
+
+await ok('generate()：图片占位块先无 URL、后有 URL，仍能取到且只取一次', async () => {
+  upstream.defaultBehavior = 'media';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.generate('画一只猫', { id: 'a1' });
+  assert.equal(r.media.length, 1, '重复下发不应产生第二条：' + JSON.stringify(r.media));
+  assert.equal(r.media[0].kind, 'image');
+  assert.equal(r.media[0].url, 'https://x.test/a.jpeg&sig=1', '应取 image_ori 且把 \\u0026 还原成 &');
+  assert.ok(r.text.includes('![](https://x.test/a.jpeg&sig=1)'), '文本里应插入 markdown 图片：' + r.text);
+});
+
+await ok('msToken：有 token 就走客户端身份（aid=582478 + msToken + 客户端 UA）', async () => {
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  assert.equal(c.clientTransport, false, '没 token 时应为网页身份');
+  const webUrl = c._buildUrl();
+  assert.ok(webUrl.includes('aid=497858'), '网页身份 aid 不变');
+  assert.equal(c.setMsToken('tok-123'), true);
+  const url = c._buildUrl();
+  assert.ok(url.includes('aid=582478'), '客户端身份 aid=582478');
+  assert.ok(url.includes('msToken=tok-123'), 'URL 要带 msToken');
+  assert.ok(url.includes('doubao_device_platform=desktop') && url.includes('client_platform=pc_client'));
+  assert.equal(c.clientTransport, true);
+  // 强制网页身份
+  const c2 = makeClient([acc('a1', COOKIE_A)], { transport: 'web' });
+  c2.setMsToken('tok-123');
+  assert.equal(c2.clientTransport, false, 'transport=web 应忽略 msToken');
+});
+
+await ok('generate()：产物卡片（10030）解析成文件条目，带打开链接与预览图', async () => {
+  upstream.defaultBehavior = 'artifact';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.generate('做一份 PPT', { id: 'a1' });
+  const files = r.media.filter(m => m.kind === 'file');
+  assert.ok(files.length >= 1, '应解析出文件条目：' + JSON.stringify(r.media));
+  const last = files[files.length - 1];
+  assert.equal(last.resourceId, 'res-1');
+  assert.equal(last.name, '季度计划', '最终标题应覆盖「制作中」');
+  assert.equal(last.url, 'https://www.doubao.com/chat/conv-9', '下载入口 = 打开这条对话');
+  assert.equal(last.previewUrl, 'https://x.test/prev.png?a=1&b=2', '预览图 URL 应还原 &');
+  assert.ok(r.text.includes('季度计划'), '文本里应有文件标题：' + r.text);
+  assert.ok(r.text.includes('https://www.doubao.com/chat/conv-9'), '文本里应有打开链接：' + r.text);
+});
+
+await ok('parseMessageBlocks：消息的 content(JSON 字符串) 能还原成块', async () => {
+  const { parseMessageBlocks } = await import('../doubao.js');
+  const msg = { content: JSON.stringify([{ content_v2: JSON.stringify({ text_block: { text: 'hi' } }), block_type: 10000 }]) };
+  const blocks = parseMessageBlocks(msg);
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].block_type, 10000);
+  assert.equal(blocks[0].content.text_block.text, 'hi');
+});
+
+await ok('latestMedia：从会话消息里回收视频直链（download_url）', async () => {
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const media = await c.latestMedia({ id: 'a1', cookie: COOKIE_A }, 'conv-test-1');
+  const v = media.find(m => m.kind === 'video');
+  assert.ok(v, '应解析出视频：' + JSON.stringify(media));
+  assert.equal(v.url, 'https://x.test/video.mp4?sig=1&x=2', '应还原 & 并用 download_url');
+  assert.equal(v.duration, 5.057);
+  assert.equal(v.cover, 'https://x.test/cover.png');
+});
+
+await ok('generateVideo：提需求 → 确认 → 轮询会话拿到 mp4', async () => {
+  upstream.defaultBehavior = 'ok';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.generateVideo('生成一段 5 秒视频：海边日落', { id: 'a1', pollMs: 50, maxWaitMs: 4000, forceConfirm: true });
+  const v = (r.media || []).find(m => m.kind === 'video');
+  assert.ok(v, '最终应拿到视频：' + JSON.stringify(r));
+  assert.equal(r.pending, false, '拿到就不该标 pending');
+  assert.ok(r.polls >= 1, '应该轮询过会话');
+  assert.equal(r.conversationId, 'conv-test-1');
+});
+
+await ok('带图提问：消息体里先 attachment_block(10052) 再 text_block(10000)', async () => {
+  upstream.defaultBehavior = 'ok';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const before = upstream.bodies.length;
+  for await (const _ of c.chat('doubao-2.1-lite', '这图里有什么', new AbortController().signal, {
+    images: [{ uri: 'tos-cn-i-a9rns2rl98/abc.png', name: 'abc.png', width: 240, height: 160 }],
+  })) { /* drain */ }
+  const sent = upstream.bodies.slice(before).find(b => b && b.messages);
+  const blocks = sent.messages[0].content_block;
+  assert.equal(blocks[0].block_type, 10052, '第一块应是附件块：' + JSON.stringify(blocks.map(b => b.block_type)));
+  const at = blocks[0].content.attachment_block.attachments[0];
+  assert.equal(at.type, 1);
+  assert.equal(at.image.uri, 'tos-cn-i-a9rns2rl98/abc.png');
+  assert.equal(at.image.image_ori.width, 240);
+  assert.equal(at.upload_status, 1, 'upload_status=1 表示已传完');
+  assert.equal(blocks[1].content.text_block.text, '这图里有什么');
+});
+
+await ok('generate() 也支持带图（生图改图同一条通道）', async () => {
+  upstream.defaultBehavior = 'media';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const before = upstream.bodies.length;
+  await c.generate('把这张图改成夜景', { id: 'a1', images: [{ uri: 'tos-cn-i-a9rns2rl98/x.png' }] });
+  const sent = upstream.bodies.slice(before).find(b => b && b.messages);
+  assert.equal(sent.messages[0].content_block[0].block_type, 10052);
+});
+
+await ok('registerImages：补 pre_handle 登记（带 local_message_id），拿回 pre_generate_id', async () => {
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const reg = await c.registerImages([{ uri: 'tos-cn-i-a9rns2rl98/x.png', name: 'x.png' }]);
+  assert.equal(reg.length, 1);
+  assert.equal(reg[0].preGenerateId, 'pg-test-1');
+  assert.ok(reg[0].identifier, '登记时应生成 identifier');
+  const sent = upstream.preHandles[upstream.preHandles.length - 1];
+  assert.equal(sent.uplink_entity.entity_type, 2);
+  assert.equal(sent.uplink_entity.entity_content.image.key, 'tos-cn-i-a9rns2rl98/x.png');
+  assert.ok(sent.local_message_id, '少了这个上游会 400 missing required parameter');
+  assert.equal(sent.uplink_entity.identifier, reg[0].identifier, 'identifier 要和消息体里的一致');
 });
 
 server.close();

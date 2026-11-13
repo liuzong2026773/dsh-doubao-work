@@ -13,6 +13,8 @@ import { dataPaths } from './paths.js';
 import { parseCookieInput, describeParse } from './cookie-input.js';
 import { candidateBrowsers, launchBrowser, grabDoubao, closeBrowser, loginAssist, openCheckinPage } from './browser.js';
 import { DoubaoClient, DoubaoError, BUILTIN_MODELS, conversationKey } from './doubao.js';
+import { readMsToken, writeMsToken, harvestMsToken } from './mstoken.js';
+import { uploadImageViaApp } from './uploader.js';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
@@ -53,6 +55,11 @@ export const Config = Schema && Schema.object({
   extraModels: Schema.array(ExtraModelSchema).description('扩展模型（后续抓到新 model_item_key 可加）').default([]),
   reasoningEffort: Schema.number().description('推理档位 0-3。0=真流式（推荐，边生成边到达）；1-3=先推理完再整段返回，质量更高但没有流式体感').min(0).max(3).default(0),
   contextReuse: Schema.boolean().description('复用豆包会话做多轮上下文（只在历史严格追加时复用，实测有效）').default(true),
+  imageInput: Schema.union(['auto', 'off']).description('把 DSH 发来的图片也传给豆包（借豆包客户端上传，需要客户端带调试端口启动）').default('auto'),
+  imageUploadWaitMs: Schema.number().description('单张图片上传等待上限（毫秒）').default(45000),
+  debugPort: Schema.number().description('豆包 PC 客户端的 CDP 调试端口（tools/start-doubao-debug.cmd 用的那个）').default(9222),
+  msToken: Schema.string().description('客户端身份用的 msToken（豆包 PC 客户端请求里的那个；留空则用缓存，缓存没有就走网页身份）').default(''),
+    transport: Schema.union(['auto', 'web']).description('auto=有 msToken 就用客户端身份；web=强制网页身份').default('auto'),
   sendSystemPrompt: Schema.boolean().description('把宿主的系统提示词（含工具说明）也发给豆包。默认关闭：豆包用不到这些工具，白吃额度还会泄露本机信息').default(false),
   conversationTtlSec: Schema.number().description('会话复用有效期（秒），超时后新建会话').min(60).default(1800),
 
@@ -83,7 +90,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.5.3';
+export const VERSION = '1.6.0';
 
 /**
  * 配置默认值。
@@ -176,6 +183,82 @@ function blockText(blocks) {
   return blocks.filter(b => b?.type === 'text').map(b => b.text).join('\n');
 }
 
+/** 从 DSH 的 content block 里抠出图片（兼容 base64 / url / image_url 几种写法） */
+export function extractImageParts(content) {
+  if (!Array.isArray(content)) return [];
+  const out = [];
+  for (const b of content) {
+    if (!b) continue;
+    if (b.type === 'image') {
+      const src = b.source || {};
+      const data = src.data || b.data || b.base64 || '';
+      const url = b.url || src.url || (b.image_url && b.image_url.url) || '';
+      if (data || url) out.push({ data, url, mediaType: src.media_type || b.media_type || 'image/png' });
+    } else if (b.type === 'image_url') {
+      const u = (b.image_url && b.image_url.url) || b.url || '';
+      if (u) out.push({ url: u, mediaType: 'image/png' });
+    }
+  }
+  return out;
+}
+
+/**
+ * 把图片交给豆包：借客户端上传（见 uploader.js），拿到 uri 后消息体才能引用。
+ * 上传失败不静默丢图——返回 note，由调用方拼进正文，让用户知道"豆包这次没看到图"。
+ * @returns {Promise<{images: Array, note: string}>}
+ */
+export async function uploadImagesForRequest(parts, deps) {
+  const { config, log, dataDir } = deps;
+  if (!parts.length) return { images: [], note: '' };
+  if (config.imageInput === 'off') {
+    return { images: [], note: '（注：本次带 ' + parts.length + ' 张图片，但配置 imageInput=off，没发给豆包）' };
+  }
+  const fs2 = await import('node:fs');
+  const path2 = await import('node:path');
+  const os2 = await import('node:os');
+  const images = [];
+  const fails = [];
+  const tmpDir = path2.join(dataDir || os2.tmpdir(), 'upload-tmp');
+  fs2.mkdirSync(tmpDir, { recursive: true });
+  for (const part of parts) {
+    let file = '';
+    try {
+      if (part.data) {
+        const b64 = String(part.data).replace(/^data:[^;]+;base64,/, '');
+        const ext = (String(part.mediaType || '').split('/')[1] || 'png').replace(/[^a-z0-9]/gi, '') || 'png';
+        file = path2.join(tmpDir, 'img-' + Date.now() + '-' + Math.round(Math.random() * 1e6) + '.' + ext);
+        fs2.writeFileSync(file, Buffer.from(b64, 'base64'));
+      } else if (/^https?:\/\//.test(part.url)) {
+        const res = await fetch(part.url, { signal: AbortSignal.timeout(30000) });
+        const buf = Buffer.from(await res.arrayBuffer());
+        const ext = (res.headers.get('content-type') || '').split('/')[1] || 'png';
+        file = path2.join(tmpDir, 'img-' + Date.now() + '.' + ext.replace(/[^a-z0-9]/gi, '') );
+        fs2.writeFileSync(file, buf);
+      } else if (part.url) {
+        file = part.url.replace(/^file:\/\//, '');
+      } else {
+        fails.push('没有可用数据');
+        continue;
+      }
+      const up = await uploadImageViaApp(file, { port: config.debugPort || 9222, waitMs: config.imageUploadWaitMs || 45000 });
+      // 客户端发消息前都会先登记一次；不登记豆包会装没看见图
+      if (deps.client && typeof deps.client.registerImages === 'function') {
+        const reg = await deps.client.registerImages([up]);
+        Object.assign(up, reg[0] || {});
+      }
+      images.push(up);
+      try { fs2.unlinkSync(file); } catch { /* 临时文件删不掉无所谓 */ }
+    } catch (e) {
+      fails.push(String(e.message || e));
+    }
+  }
+  if (fails.length) {
+    log('warn', '图片上传失败：' + fails.join('；'));
+    return { images, note: '（注：本次有 ' + fails.length + ' 张图片没能传给豆包，原因：' + fails[0] + '。它现在看不到这些图，请别当作已读图回答）' };
+  }
+  return { images, note: '' };
+}
+
 /**
  * 粗略 token 估算（只用于 usage 上报，不参与计费）。
  * 中文/全角约 1 字 1 token，ASCII 约 4 字符 1 token——比一律 length/4 更接近真实。
@@ -265,7 +348,7 @@ export class DoubaoLlmAdapter extends AdapterBase {
       id: m.id,
       name: m.name,
       description: m.description || '',
-      inputModalities: ['text'],
+      inputModalities: this.deps.config.imageInput === 'off' ? ['text'] : ['text', 'image'],
     }));
   }
 
@@ -278,7 +361,7 @@ export class DoubaoLlmAdapter extends AdapterBase {
       id: m.id,
       name: m.name,
       description: m.description || '豆包工作模型（免费额度/0.01x）',
-      inputModalities: ['text'],
+      inputModalities: this.deps.config.imageInput === 'off' ? ['text'] : ['text', 'image'],
       context: { contextWindow: 128000 },
     };
   }
@@ -324,7 +407,13 @@ export class DoubaoLlmAdapter extends AdapterBase {
     let first = true;
     let result = null;
     try {
-      const gen = client.chat(model, text, signal, { conversationId: reuseId || '' });
+      const parts = tailMsgs.flatMap(m => extractImageParts(m.content));
+      const uploaded = await uploadImagesForRequest(parts, {
+        config: this.deps.config, log, dataDir: this.deps.dataDir, client,
+      });
+      const sendText = text + (uploaded.note || '');
+      if (uploaded.images.length) log('info', `本轮带图 ` + uploaded.images.length + ` 张（${uploaded.images.map(i => i.uri.split('/').pop()).join(', ')}）`);
+      const gen = client.chat(model, sendText, signal, { conversationId: reuseId || '', images: uploaded.images });
       while (true) {
         const { value: delta, done } = await gen.next();
         if (done) { result = delta; full = delta?.text || full; break; }
@@ -405,12 +494,21 @@ export function apply(ctx, rawConfig) {
     { ...config, accounts },
     { statePath: files.statePath, accountsPath: files.accountsPath, log },
   );
+  // msToken：有它就能用「客户端身份」发请求（网页身份容易被 710022004 人机验证挡住）
+  const cachedToken = readMsToken(files.dir);
+  const bootToken = String(config.msToken || cachedToken.token || '').trim();
+  if (bootToken) {
+    client.setMsToken(bootToken);
+    log('info', `上游身份：客户端（aid=582478，msToken 来自${config.msToken ? '配置' : '缓存'}）`);
+  } else {
+    log('info', '上游身份：网页（没有 msToken，可用「抓取 msToken」或 tools/mstoken.mjs 切换成客户端身份）');
+  }
   log('info', `数据目录：${files.dir}`);
 
   const models = client.models();
   log('info', `已注册 provider "${config.providerId}"：${models.map(m => m.id).join(', ')}｜账号 ${accounts.filter(a => a.enabled !== false).length} 个`);
 
-  ctx.llm.registerAdapter([config.providerId], new DoubaoLlmAdapter({ client, config, log }));
+  ctx.llm.registerAdapter([config.providerId], new DoubaoLlmAdapter({ client, config, log, dataDir: files.dir }));
 
   // ---------------- 每日自动签到 ----------------
   /** 排定状态，给 /doubao/status 与面板显示「下次几点签」用 */
@@ -821,6 +919,121 @@ export function apply(ctx, rawConfig) {
       });
 
       // 用豆包客户端 UA 打开签到页：这一页只在客户端里给签到按钮（页面读 UA 尾巴的 SamanthaDoubao/<版本>）
+      // ---------------- msToken（客户端身份凭证） ----------------
+      register({
+        kind: 'exact',
+        path: '/doubao/mstoken',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = (await parseBody(req)) || {};
+          const action = String(body.action || 'status');
+          try {
+            if (action === 'set') {
+              const token = String(body.token || '').trim();
+              if (!token) return json(res, 400, { ok: false, error: '需要 token' });
+              client.setMsToken(token);
+              writeMsToken(files.dir, token, 'manual');
+              return json(res, 200, { ok: true, token: token.slice(0, 16) + '…', transport: 'client', hint: '已切换为客户端身份，立即生效（不用重启）' });
+            }
+            if (action === 'harvest') {
+              const port = Number(body.port) || 9222;
+              const r = await harvestMsToken({ port, waitMs: Number(body.waitMs) || 20000 });
+              if (!r.token) return json(res, 200, { ok: false, transport: client.clientTransport ? 'client' : 'web', error: r.reason || '没摘到' });
+              client.setMsToken(r.token);
+              writeMsToken(files.dir, r.token, r.source);
+              return json(res, 200, { ok: true, token: r.token.slice(0, 16) + '…', source: r.source, transport: 'client' });
+            }
+            if (action === 'clear') {
+              client.setMsToken('');
+              writeMsToken(files.dir, '', 'clear');
+              return json(res, 200, { ok: true, transport: 'web' });
+            }
+            const c = readMsToken(files.dir);
+            json(res, 200, {
+              ok: true,
+              transport: client.clientTransport ? 'client' : 'web',
+              cached: c.token ? { token: c.token.slice(0, 16) + '…', at: c.at, ageMinutes: Math.round((Date.now() - c.at) / 60000), source: c.source } : null,
+              hint: '客户端身份需要有效 msToken：在豆包里随便点两下，再点「抓取 msToken」',
+            });
+          } catch (e) {
+            json(res, 500, { ok: false, error: String(e.message || e) });
+          }
+        },
+      });
+
+      // ---------------- 图片上传（本地图 → 豆包 uri） ----------------
+      register({
+        kind: 'exact',
+        path: '/doubao/image/upload',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = (await parseBody(req)) || {};
+          const file = String(body.path || '').trim();
+          if (!file) return json(res, 400, { ok: false, error: '需要 path（本地图片绝对路径）' });
+          try {
+            const up = await uploadImageViaApp(file, { port: config.debugPort || 9222, waitMs: config.imageUploadWaitMs || 45000 });
+            const reg = await client.registerImages([up]);
+            json(res, 200, {
+              ok: true, ...reg[0], transport: client.clientTransport ? 'client' : 'web',
+              hint: '拿到 uri 就能带图提问了：/doubao/generate 传 imagePath 或 images',
+            });
+          } catch (e) {
+            json(res, 500, { ok: false, error: String(e.message || e), kind: e.kind || '' });
+          }
+        },
+      });
+
+      // ---------------- 生成（生图 / 生视频 / 出文件） ----------------
+      register({
+        kind: 'exact',
+        path: '/doubao/generate',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = (await parseBody(req)) || {};
+          const prompt = String(body.prompt || '').trim();
+          const kind = String(body.kind || 'image');
+          if (!prompt) return json(res, 400, { ok: false, error: '需要 prompt' });
+          try {
+            const convId = typeof body.conversationId === 'string' ? body.conversationId : '';
+            // imagePath：本地图片 → 上传 + 登记 → 一起发过去（改图 / 看图）
+            let images = [];
+            const imagePath = typeof body.imagePath === 'string' ? body.imagePath.trim() : '';
+            if (imagePath) {
+              const up = await uploadImageViaApp(imagePath, { port: config.debugPort || 9222, waitMs: config.imageUploadWaitMs || 45000 });
+              const reg = await client.registerImages([up]);
+              images = reg;
+            }
+            const isVideo = kind === 'video';
+            const r = isVideo
+              ? await client.generateVideo(prompt, { id: typeof body.id === 'string' ? body.id : '', conversationId: convId, pollMs: Number(body.pollMs) || 0, maxWaitMs: Number(body.maxWaitMs) || 0, timeoutMs: Number(body.timeoutMs) || 0, forceConfirm: body.forceConfirm === true, images })
+              : await client.generate(prompt, { id: typeof body.id === 'string' ? body.id : '', conversationId: convId, timeoutMs: Number(body.timeoutMs) || 0, images });
+            const media = r.media || [];
+            const wanted = media.filter(m => kind === 'any' || m.kind === kind);
+            json(res, 200, {
+              ok: true,
+              kind,
+              account: r.account,
+              conversationId: r.conversationId || convId,
+              text: r.text,
+              media: wanted,
+              all: media,
+              pending: r.pending === true,
+              polls: r.polls,
+              transport: client.clientTransport ? 'client' : 'web',
+              hint: r.pending
+                ? '视频还在生成：豆包是"生成好后自己发消息"，稍后带同一个 conversationId 再调一次就能取到 mp4'
+                : (wanted.length
+                  ? '已拿到产出（图片/视频直链有时效，尽快下载；文件在豆包云端，点链接进对话下载）'
+                  : (/确认|参数确认/.test(r.text || '') && kind === 'video'
+                    ? '豆包先给了参数确认：把 conversationId 带上再发一句「确认，开始生成」才会真出片'
+                    : '上游没给媒体，只回了文字：可能额度不足、或它认为这是个纯文本任务')),
+            });
+          } catch (e) {
+            json(res, 500, { ok: false, error: String(e.message || e), kind: e.kind || '', code: e.code || 0 });
+          }
+        },
+      });
+
       register({
         kind: 'exact',
         path: '/doubao/checkin/open',

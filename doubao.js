@@ -19,6 +19,9 @@ import path from 'node:path';
 const BOT_ID = '7338286299411103781';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
 
+/** 豆包 PC 客户端的 UA：尾部多了 SamanthaDoubao/<版本>，服务端据此判定"官方客户端" */
+export const CLIENT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.7727.149 Safari/537.36 SamanthaDoubao/2.35.12';
+
 // 豆包 PC 端每日签到活动 scene（即接口里的 campaign_group_code），客户端固定值
 const CHECKIN_SCENE = 'pc_incentive_task_mvp_v3';
 const uuid = () => crypto.randomUUID();
@@ -48,6 +51,85 @@ function msUntilMidnightCN(ts = Date.now()) {
   const t = cnDate(ts);
   const next = Date.UTC(t.getUTCFullYear(), t.getUTCMonth(), t.getUTCDate() + 1);
   return Math.max(1000, next - t.getTime());
+}
+
+/**
+ * 消息里的块 → 媒体条目（图片 / 视频 / 产物卡片）。
+ * SSE 流和 /alice/conversation/latest_messagelist 拉回来的消息都用它，保证两条路径解析一致。
+ * seen：去重集合（键含状态：产物卡片 title/status 会刷新，所以按"变化"去重）。
+ */
+export function pickBlocksMedia(blocks, seen = new Set()) {
+  const out = [];
+  for (const b of blocks || []) {
+    const bt = Number(b && b.block_type);
+    if (bt === 10030) {
+      const a = b && b.content && b.content.artifact_block;
+      const rid = String((a && a.resource_id) || '');
+      if (!rid) continue;
+      const conv = String((a && a.conversation_id) || '');
+      const title = String((a && a.title) || '未命名文件');
+      const status = Number(a && a.status) || 0;
+      const key = 'artifact|' + rid + '|' + status + '|' + title;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push({
+        kind: 'file',
+        url: conv ? 'https://www.doubao.com/chat/' + conv : 'https://www.doubao.com/drive-iframe/drive/home/',
+        name: title,
+        resourceId: rid,
+        conversationId: conv,
+        contentType: String((a && a.resource_content_type) || ''),
+        status,
+        previewUrl: String((a && a.brief_image && a.brief_image.image_thumb && a.brief_image.image_thumb.url) || '').replace(/\\u0026/g, '&'),
+        openIn: 'doubao',
+      });
+      continue;
+    }
+    if (bt !== 2074) continue;
+    const creations = (b.content && b.content.creation_block && b.content.creation_block.creations) || [];
+    for (const cr of creations) {
+      // 同一个创作块会分两次下发：先 `{image:{status,placeholder}}` 占位，再带真 URL。
+      // 去重必须等拿到 URL 之后再做，否则占位那次把 id 记进 seen，真 URL 反而被当重复丢掉。
+      const img = (cr.image && (cr.image.image_ori || cr.image.image_thumb) || {}).url || '';
+      const v = cr.video || {};
+      const vid = v.download_url || (v.video_ori && v.video_ori.url) || v.url || v.play_url || '';
+      const f = cr.file || {};
+      const file = f.url || f.file_url || '';
+      const name = f.name || v.name || '';
+      const url = String(img || vid || file || '').replace(/\\u0026/g, '&');
+      if (!url) continue;
+      const key = 'media|' + String(cr.id || '') + '|' + url;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      if (img) out.push({ kind: 'image', url });
+      else if (vid) out.push({ kind: 'video', url, name, duration: v.duration, width: v.width, height: v.height, cover: (v.cover && ((v.cover.image_preview && v.cover.image_preview.url) || (v.cover.image_thumb && v.cover.image_thumb.url))) || '' });
+      else out.push({ kind: 'file', url, name });
+    }
+  }
+  return out;
+}
+
+/** 消息对象 → 块数组。content 是 JSON 字符串（数组或对象），content_v2 里是解析好的块内容 */
+export function parseMessageBlocks(msg) {
+  const blocks = [];
+  const push = (c) => {
+    if (typeof c === 'string') {
+      try { c = JSON.parse(c); } catch { return; }
+    }
+    if (Array.isArray(c)) { for (const x of c) push(x); return; }
+    if (!c || typeof c !== 'object') return;
+    if (c.content_v2) {
+      let v2 = c.content_v2;
+      if (typeof v2 === 'string') { try { v2 = JSON.parse(v2); } catch { v2 = null; } }
+      if (v2) { blocks.push({ block_type: c.block_type, content: v2 }); return; }
+    }
+    if (c.content && typeof c.content === 'object') { blocks.push({ block_type: c.block_type, content: c.content }); return; }
+    if (c.content_block) { push(c.content_block); return; }
+    blocks.push(c);
+  };
+  if (!msg) return blocks;
+  push(msg.content !== undefined ? msg.content : msg.content_block || msg);
+  return blocks;
 }
 
 /** 带机器码的上游错误：kind ∈ auth | ratelimit | upstream | network | noaccount | empty | aborted */
@@ -92,6 +174,8 @@ export class DoubaoClient {
   constructor(config, opts = {}) {
     this.cfg = config;
     this.log = opts.log || (() => {});
+    /** 客户端身份用的 msToken（由宿主/工具注入，见 mstoken.js）；没有就退回网页身份 */
+    this.msToken = '';
     // 上游站点可替换：默认豆包网页版；测试/自托管镜像时改 baseUrl 指向 mock 服务器
     this.baseUrl = (config.baseUrl || 'https://www.doubao.com').replace(/\/+$/, '');
     this.statePath = opts.statePath;
@@ -642,7 +726,56 @@ export class DoubaoClient {
 
   // ---------- 上游调用 ----------
 
+  /** 客户端身份参数：豆包 PC 客户端用的是另一套 aid/版本号，服务端对它的风控宽松得多 */
+  _clientQuery() {
+    const u = this.cfg.upstream || {};
+    const d = u.client || {};
+    return {
+      aid: d.aid || '582478',
+      real_aid: d.aid || '582478',
+      channel: d.channel || 'win',
+      client_platform: 'pc_client',
+      chromium_version: d.chromium_version || '147.0.7727.149',
+      device_platform: 'web',
+      doubao_device_platform: 'desktop',
+      device_id: d.device_id || '2955100808290061',
+      doubao_pc_version: d.pc_version || '2.35.12',
+      fp: d.fp || ('verify_' + (d.device_id || '2955100808290061')),
+      language: u.language || 'zh',
+      msToken: this.msToken,
+      pc_version: d.pc_version || '2.35.12',
+      pkg_type: 'release_version',
+      region: u.region || 'CN',
+      runtime: 'web',
+      runtime_version: d.runtime_version || '3.44.9',
+      samantha_web: '1',
+      sys_region: u.region || 'CN',
+      tea_uuid: d.tea_uuid || d.device_id || '2955100808290061',
+      tz_name: u.tz_name || 'Asia/Shanghai',
+      'use-olympus-account': '1',
+      version_code: u.version_code || '20800',
+      web_id: d.web_id || '7643110262430762537',
+      web_platform: 'desktop',
+      web_tab_id: uuid(),
+    };
+  }
+
+  /** 有 msToken 就走客户端身份，否则回退网页身份（网页侧更容易被要求人机验证） */
+  get clientTransport() {
+    return !!(this.msToken && this.cfg.transport !== 'web');
+  }
+
+  /** 由宿主/工具注入抓到的 msToken */
+  setMsToken(token) {
+    this.msToken = String(token || '').trim();
+    return this.clientTransport;
+  }
+
   _buildUrl() {
+    if (this.clientTransport) {
+      const q = new URLSearchParams(this._clientQuery());
+      return this.baseUrl + '/chat/completion?' + q.toString();
+    }
     const u = this.cfg.upstream || {};
     const p = new URLSearchParams({
       aid: u.aid || '497858',
@@ -707,6 +840,9 @@ export class DoubaoClient {
     // 网页版工作模式实测：模型由 need_deep_think(=item_id) 决定，
     // model_item_key 只是辅助；推理档位可取到 4。
     const itemId = Number(m.itemId) || 0;
+    // chatMode：走普通对话（agent_mode=2, mode_id='1', model_item_key='0'）。
+    // 实测豆包客户端在普通对话里就能生图/生视频/出文件，反而是工作模式会多一层 agent 规划。
+    const chatMode = m.chatMode === true;
     const maxEffort = Number(m.maxReasoningEffort) || (itemId ? 4 : 3);
     const effort = Math.min(maxEffort, Math.max(0, Number(this.cfg.reasoningEffort ?? 0) || 0));
     return {
@@ -716,26 +852,58 @@ export class DoubaoClient {
       },
       messages: [{
         local_message_id: uuid(),
-        content_block: [{ block_type: 10000, content: { text_block: { text, icon_url: '', icon_url_dark: '', summary: '' }, pc_event_block: '' }, block_id: uuid(), parent_id: '', meta_info: [], extra_info: {}, append_fields: [] }],
+        content_block: [
+          // 图片块在最前，跟网页版发消息的顺序一致（实测：attachment_block 先、text_block 后）
+          ...(m.images && m.images.length ? [{
+            block_type: 10052,
+            content: {
+              attachment_block: {
+                attachments: m.images.map(im => ({
+                  type: 1,
+                  identifier: im.identifier || uuid(),
+                  image: {
+                    name: im.name || 'image.png',
+                    uri: im.uri,
+                    image_ori: {
+                      url: '',
+                      width: Number(im.width) || 0,
+                      height: Number(im.height) || 0,
+                      format: im.format || String(im.name || im.uri || '').split('.').pop() || 'png',
+                      url_formats: {},
+                    },
+                  },
+                  parse_state: 0,
+                  review_state: 1,
+                  upload_status: 1,
+                  progress: 100,
+                  src: '',
+                })),
+              },
+              pc_event_block: '',
+            },
+            block_id: uuid(), parent_id: '', meta_info: [], extra_info: {}, append_fields: [],
+          }] : []),
+          { block_type: 10000, content: { text_block: { text, icon_url: '', icon_url_dark: '', summary: '' }, pc_event_block: '' }, block_id: uuid(), parent_id: '', meta_info: [], extra_info: {}, append_fields: [] },
+        ],
         message_status: 0,
       }],
       option: {
         send_message_scene: '', create_time_ms: now, collect_id: '', is_audio: false,
-        answer_with_suggest: false, agent_mode: 1, tts_switch: false, need_deep_think: itemId,
+        answer_with_suggest: false, agent_mode: chatMode ? 2 : 1, tts_switch: false, need_deep_think: chatMode ? 0 : itemId,
         click_clear_context: false, from_suggest: false, is_regen: false, is_replace: false,
         is_from_click_option: false, is_from_click_softlink: false, disable_sse_cache: false,
         select_text_action: '', is_select_text: false, resend_for_regen: false, scene_type: 0,
         unique_key: uuid(), start_seq: 0, need_create_conversation: !conversationId,
-        conversation_mode: 2,
+        conversation_mode: chatMode ? undefined : 2,
         conversation_init_option: { project_id: '', need_ack_conversation: true },
         conversation_init_ext: {
           // 工作模式必须带这个串，否则上游不按工作台运行（实测网页版就是这段）
           agent_task_param: JSON.stringify({
             runtime_type: 1, folder_name: '', device_name: '', workspace: '', local_app_id: '', local_device_id: '',
           }),
-          model_item_key: modelItemKey,
+          model_item_key: chatMode ? '0' : modelItemKey,
           reasoning_effort: String(effort),
-          mode_id: '3',
+          mode_id: chatMode ? '1' : '3',
         },
         regen_query_id: [], edit_query_id: [], regen_instruction: '', no_replace_for_regen: false,
         message_from: 0, shared_app_name: '', shared_app_id: '',
@@ -744,13 +912,192 @@ export class DoubaoClient {
         recovery_option: { is_recovery: false, req_create_time_sec: Math.floor(now / 1000), append_sse_event_scene: 0 },
         message_storage_type: 0, related_deleted_message_ids: {}, connector_info_list: [],
         model_config: {
-          model_item_key: modelItemKey,
+          model_item_key: chatMode ? '0' : modelItemKey,
           model_extra_params: m.extraParams && typeof m.extraParams === 'object' ? m.extraParams : {},
           reasoning_effort: effort,
         },
         aggregate_params: {},
       },
     };
+  }
+
+  /**
+   * 生成类调用（生图 / 生视频 / 出文件）：走普通对话模式，收集文本与媒体产出。
+   * 上游把图片放在 block_type=2074 的创作块里（见 chatOnce 的 pickMedia）。
+   * @returns {Promise<{text: string, media: Array<{kind:string,url:string,name?:string}>}>}
+   */
+  async generate(prompt, options = {}) {
+    const acc = options.account || this._pickAccount(options.id);
+    if (!acc) throw new DoubaoError('noaccount', '没有可用账号（先导入一个 Cookie）');
+    const spec = { chatMode: true, modelItemKey: '0', itemId: 0, images: Array.isArray(options.images) ? options.images.filter(im => im && im.uri) : [] };
+    const attempt = { text: '', conversationId: '', ackModelItemKey: '' };
+    if (options.dump) attempt.dump = String(options.dump);
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Number(options.timeoutMs) || Math.max(Number(this.cfg.requestTimeoutMs) || 180000, 300000));
+    let text = '';
+    try {
+      // conversationId：生视频这类任务需要"多轮"——第一轮它只回参数确认，第二轮「确认」才真生成
+      for await (const chunk of this.chatOnce(acc, spec, String(prompt || ''), ctrl.signal, String(options.conversationId || ''), attempt)) text += chunk;
+    } finally {
+      clearTimeout(timer);
+      try { ctrl.abort(); } catch { /* ignore */ }
+    }
+    return { text, media: attempt.media || [], conversationId: attempt.conversationId || '', account: acc.id };
+  }
+
+  /**
+   * 生视频：豆包不是同步出片，分三步
+   *   1) 发需求 → 它回"参数确认"（模型/时长/比例）
+   *   2) 发「确认」→ 它回"生成好后我发给你"（这时任务才真正排队）
+   *   3) 轮询会话消息（/alice/conversation/latest_messagelist），直到出现
+   *      block_type=2074 且 creations[].video.download_url
+   * @returns {Promise<{text: string, media: Array, conversationId: string, polls: number, pending: boolean}>}
+   */
+  async generateVideo(prompt, options = {}) {
+    const acc = options.account || this._pickAccount(options.id);
+    if (!acc) throw new DoubaoError('noaccount', '没有可用账号（先导入一个 Cookie）');
+    const log = options.log || this.log;
+    let convId = String(options.conversationId || '');
+    let text = '';
+
+    // 第 1 步：提需求（已有会话就直接续）
+    const first = await this.generate(prompt, { account: acc, conversationId: convId, timeoutMs: options.timeoutMs });
+    text = first.text;
+    convId = first.conversationId || convId;
+    // 已经出片（比如续问时）就直接返回
+    if ((first.media || []).some(m => m.kind === 'video')) {
+      return { ...first, polls: 0, pending: false };
+    }
+
+    // 第 2 步：确认。它问"确认后我再开始生成"时才发，避免多花一轮额度
+    const needConfirm = /确认|参数确认|请先确认/.test(text) || options.forceConfirm;
+    if (needConfirm) {
+      const second = await this.generate(options.confirmText || '确认，开始生成', { account: acc, conversationId: convId, timeoutMs: options.timeoutMs, dump: options.dump });
+      text += '\n' + second.text;
+      convId = second.conversationId || convId;
+      if ((second.media || []).some(m => m.kind === 'video')) {
+        return { ...second, text, conversationId: convId, polls: 0, pending: false };
+      }
+    }
+
+    // 第 3 步：轮询会话，等视频消息出现
+    const everyMs = Number(options.pollMs) || 15000;
+    const maxMs = Number(options.maxWaitMs) || 8 * 60 * 1000;
+    const started = Date.now();
+    let polls = 0;
+    while (Date.now() - started < maxMs) {
+      polls++;
+      await new Promise(r => setTimeout(r, polls === 1 ? Math.min(everyMs, 5000) : everyMs));
+      let found = [];
+      try {
+        found = await this.latestMedia(acc, convId);
+      } catch (e) {
+        log('warn', '轮询会话失败：' + e.message);
+      }
+      const video = found.find(m => m.kind === 'video');
+      if (video) {
+        return { text, media: found, conversationId: convId, account: acc.id, polls, pending: false };
+      }
+      log('info', `视频还在生成（第 ${polls} 次轮询，已等 ${Math.round((Date.now() - started) / 1000)}s）`);
+    }
+    return { text, media: [], conversationId: convId, account: acc.id, polls, pending: true };
+  }
+
+  /**
+   * 把已上传的图片在豆包服务端登记一次（/alice/message/pre_handle_v2_without_conv）。
+   * 客户端发消息前必做：只带 uri 不登记，模型会回"我这边没有收到图片"（实测踩过两次）。
+   * 登记靠 identifier 跟消息体里的 attachment_block 对齐。
+   */
+  async registerImages(images, account) {
+    const acc = account || this._pickAccount();
+    if (!acc) throw new DoubaoError('noaccount', '没有可用账号（先导入一个 Cookie）');
+    const out = [];
+    for (const im of images || []) {
+      if (!im || !im.uri) continue;
+      const identifier = im.identifier || uuid();
+      const body = {
+        uplink_entity: { entity_type: 2, entity_content: { image: { key: im.uri } }, identifier },
+        bot_id: this.cfg.botId || BOT_ID,
+        local_message_id: uuid(),
+      };
+      let res;
+      const regUrl = this._apiUrl('/alice/message/pre_handle_v2_without_conv');
+      try {
+        res = await fetch(regUrl, {
+          method: 'POST',
+          headers: {
+            'content-type': 'application/json',
+            cookie: acc.cookie.trim(),
+            'user-agent': this.clientTransport ? CLIENT_UA : UA,
+            'agw-js-conv': 'str, str',
+            referer: this.clientTransport ? 'chrome://doubao-chat/' : 'https://www.doubao.com/chat/',
+          },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(30000),
+        });
+      } catch (e) {
+        throw new DoubaoError('network', '图片登记网络错误: ' + e.message);
+      }
+      const raw = await res.text().catch(() => '');
+      let j = null;
+      try { j = JSON.parse(raw); } catch { /* 上游偶尔回非 JSON（网关错误页） */ }
+      if (!j || j.code !== 0) throw new DoubaoError('upstream', `图片登记失败 code=${j && j.code} ${(j && j.msg) || ''}｜HTTP ${res.status}｜${raw.slice(0, 140)}`);
+      out.push({ ...im, identifier, preGenerateId: (j.data && j.data.pre_generate_id) || '' });
+    }
+    return out;
+  }
+
+  /** 把路径拼成上游 URL（沿用当前身份：客户端 / 网页） */
+  _apiUrl(pathname) {
+    const base = this.baseUrl + pathname;
+    if (this.clientTransport) return base + '?' + new URLSearchParams(this._clientQuery()).toString();
+    const web = this._buildUrl();
+    return base + '?' + web.slice(web.indexOf('?') + 1);
+  }
+
+  /**
+   * 拉某个会话的最新消息，并把里面的媒体块抽出来。
+   * 生图/生视频/文件卡片都会在消息里留档，所以这个方法是"异步产出"的通用回收器。
+   */
+  async latestMedia(account, conversationId) {
+    if (!account || !conversationId) return [];
+    const res = await fetch(this._apiUrl('/alice/conversation/latest_messagelist'), {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        cookie: account.cookie.trim(),
+        'user-agent': this.clientTransport ? CLIENT_UA : UA,
+        'agw-js-conv': 'str, str',
+        referer: this.clientTransport ? 'chrome://doubao-chat/' : 'https://www.doubao.com/chat/',
+      },
+      body: JSON.stringify({ request_list: [{ conversation_id: conversationId, bot_id: this.cfg.botId || '7338286299411103781' }] }),
+      signal: AbortSignal.timeout(30000),
+    });
+    const j = await res.json().catch(() => null);
+    if (!j || j.code !== 0) throw new DoubaoError('upstream', `拉会话消息失败 code=${j && j.code} ${(j && j.msg) || ''}`);
+    const list = j?.data?.message_map?.[conversationId] || [];
+    const out = [];
+    const seen = new Set();
+    for (const msg of list) {
+      const blocks = parseMessageBlocks(msg);
+      for (const b of blocks) {
+        for (const m of pickBlocksMedia([b], new Set())) {
+          const key = m.kind + '|' + m.url;
+          if (seen.has(key)) continue;
+          seen.add(key);
+          out.push(m);
+        }
+      }
+    }
+    return out;
+  }
+
+  /** 选一个可用账号：显式 id 优先，否则取第一个没冷却的 */
+  _pickAccount(id) {
+    const list = this._accounts().filter(a => a.enabled !== false);
+    if (id) return list.find(a => a.id === id) || null;
+    const now = Date.now();
+    return list.find(a => !(this._accState(a.id).coolUntil > now)) || list[0] || null;
   }
 
   /**
@@ -769,6 +1116,29 @@ export class DoubaoClient {
     // 记账对象：让上层看到"已输出多少 / 服务端会话号是多少"
     const sink = attempt || { text: '', conversationId: '', ackModelItemKey: '' };
 
+    /**
+     * 从 content_block 里抠出"不是文本"的产出：
+     *  - block_type 2074 = 创作块（生图 / 生视频），图片在 creation_block.creations[].image
+     *  - block_type 10030 = 产物卡片（PPT / Word / PDF / 表格）。它没有直链，只有
+     *    resource_id + conversation_id，文件存在豆包云端，下载要在豆包里点卡片。
+     *    所以这里给出「打开这条对话」的链接（chatUrl）当下载入口。
+     */
+    // 具体解析逻辑在模块级 pickBlocksMedia()：SSE 流和"事后拉会话消息"共用一个实现，避免两套解析跑偏
+    const pickMedia = (blocks) => {
+      if (!sink.mediaSeen) sink.mediaSeen = new Set();
+      return pickBlocksMedia(blocks, sink.mediaSeen);
+    };
+    /** 把新产出的媒体推给上层：图片走 markdown（DSH 会渲染），视频/文件给可点链接 */
+    const emitMedia = function* (blocks) {
+      for (const m of pickMedia(blocks)) {
+        if (!sink.media) sink.media = [];
+        sink.media.push(m);
+        if (m.kind === 'image') yield push('\n\n![](' + m.url + ')\n\n');
+        else if (m.kind === 'video') yield push('\n\n[视频](' + m.url + ')\n\n');
+        else yield push('\n\n📄 [' + (m.name || '文件') + '](' + m.url + ')\n\n> 文件存在豆包云端，打开链接后点卡片右下角「下载/导出」即可保存\n\n');
+      }
+    };
+
     /** 归类中止：区分"调用方取消"和"上游超时"，两者在 DSH 里处置方式不同 */
     const abortKind = (e) => {
       if (signal?.aborted) return new DoubaoError('aborted', '请求已取消');
@@ -784,8 +1154,8 @@ export class DoubaoClient {
           'content-type': 'application/json',
           cookie: account.cookie.trim(),
           'agw-js-conv': 'str, str',
-          'user-agent': UA,
-          referer: 'https://www.doubao.com/chat/',
+          'user-agent': this.clientTransport ? CLIENT_UA : UA,
+          referer: this.clientTransport ? 'chrome://doubao-chat/' : 'https://www.doubao.com/chat/',
           accept: 'text/event-stream',
         },
         body: JSON.stringify(this._buildBody(text, modelItemKey, conversationId)),
@@ -839,6 +1209,10 @@ export class DoubaoClient {
           throw abortKind(e) || new DoubaoError('network', `上游流读取中断: ${e.message}`);
         }
         const { done, value } = chunk;
+        // 调试转储：把上游原始 SSE 落盘，排查"文本有、卡片没解析出来"这类问题用
+        if (sink.dump) {
+          try { if (value) fs.appendFileSync(sink.dump, Buffer.from(value)); } catch { /* 转储失败不影响主流程 */ }
+        }
         // flush 尾部残留字节，避免多字节字符被截断
         if (done) buf += dec.decode();
         else buf += dec.decode(value, { stream: true });
@@ -868,12 +1242,24 @@ export class DoubaoClient {
                   const t = b?.content?.text_block?.text;
                   if (typeof t === 'string' && t) yield push(t);
                 }
+                yield* emitMedia(op?.patch_value?.content_block);
               }
             } else if (evName === 'STREAM_MSG_NOTIFY') {
               const d = JSON.parse(dataStr);
               for (const b of d?.content?.content_block || []) {
                 const t = b?.content?.text_block?.text;
                 if (typeof t === 'string' && t) yield push(t);
+              }
+              yield* emitMedia(d?.content?.content_block);
+            } else if (evName === 'FULL_MSG_NOTIFY') {
+              const d = JSON.parse(dataStr);
+              for (const op of d.patch_op || []) {
+                if (op.patch_object !== 1) continue;
+                for (const b of op?.patch_value?.content_block || []) {
+                  const t = b?.content?.text_block?.text;
+                  if (typeof t === 'string' && t) yield push(t);
+                }
+                yield* emitMedia(op?.patch_value?.content_block);
               }
             } else if (evName === 'STREAM_ERROR') {
               // 上游在流里报错（最常见的不是"没内容"，而是风控/限流）：
@@ -949,6 +1335,8 @@ export class DoubaoClient {
     if (!spec) {
       throw new DoubaoError('upstream', `未知模型 ${modelId || '(空)'}：本插件只接豆包账号，可选模型为 ${this.modelIds().join(', ')}`);
     }
+    // 宿主传进来的图片（已上传成豆包 uri）：DSH 发图 → 豆包看图 走这里
+    spec.images = Array.isArray(opts.images) ? opts.images.filter(im => im && im.uri) : [];
     this.log('info', `模型映射 ${modelId} -> ${spec.modelItemKey}（need_deep_think=${spec.itemId}）`);
     const maxAttempts = Math.max(1, this.cfg.maxAttempts ?? 2);
     const tried = new Set();

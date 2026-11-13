@@ -60,6 +60,9 @@ ok('注册了预期路由集合（18 精确 + 1 /api 前缀）', () => {
     '/doubao/checkin',
     '/doubao/checkin/open',
     '/doubao/checkin/status',
+    '/doubao/generate',
+    '/doubao/image/upload',
+    '/doubao/mstoken',
     '/doubao/models/probe',
     '/doubao/browser/login',
     '/doubao/browser/wait',
@@ -1025,4 +1028,32 @@ await ok('模型选择三件套：need_deep_think / model_extra_params / agent_t
   assert.equal(client.resolveModelSpec('doubao-2.1-lite').itemId, 0);
 });
 
+ok('extractImageParts：认得 base64 / url / image_url 三种写法', async () => {
+  const parts = mod.extractImageParts([
+    { type: 'text', text: '看这张' },
+    { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'AAAA' } },
+    { type: 'image', url: 'https://x.test/a.jpg' },
+    { type: 'image_url', image_url: { url: 'data:image/png;base64,BBBB' } },
+  ]);
+  assert.equal(parts.length, 3, JSON.stringify(parts));
+  assert.equal(parts[0].data, 'AAAA');
+  assert.equal(parts[1].url, 'https://x.test/a.jpg');
+  assert.equal(parts[2].url, 'data:image/png;base64,BBBB');
+});
+
+ok('uploadImagesForRequest：imageInput=off 时明确告知没发图，而不是假装发了', async () => {
+  const r = await mod.uploadImagesForRequest([{ data: 'AA' }], {
+    config: { imageInput: 'off' }, log: () => {}, dataDir: DATA_DIR,
+  });
+  assert.equal(r.images.length, 0);
+  assert.ok(/没发给豆包/.test(r.note), r.note);
+});
+
+ok('uploadImagesForRequest：客户端不在调试端口时给出原因 + 提醒 note', async () => {
+  const r = await mod.uploadImagesForRequest([{ url: 'C:/tmp/不存在.png' }], {
+    config: { imageInput: 'auto', debugPort: 1, imageUploadWaitMs: 1000 }, log: () => {}, dataDir: DATA_DIR,
+  });
+  assert.equal(r.images.length, 0);
+  assert.ok(/没能传给豆包/.test(r.note), '应有提示：' + r.note);
+});
 console.log('\n全部通过：' + passed + ' 项');
