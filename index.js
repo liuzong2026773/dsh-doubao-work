@@ -181,7 +181,7 @@ export function apply(ctx, config) {
   const pluginDir = path.dirname(fileURLToPath(import.meta.url));
   const client = new DoubaoClient(
     { ...config, accounts },
-    { statePath: path.join(pluginDir, 'gateway-state.json'), log },
+    { statePath: path.join(pluginDir, 'gateway-state.json'), accountsPath: path.join(pluginDir, 'accounts.json'), log },
   );
 
   const models = client.models();
