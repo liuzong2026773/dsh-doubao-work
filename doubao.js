@@ -49,6 +49,7 @@ export class DoubaoClient {
     this.accountsPath = opts.accountsPath; // accounts.json 热加载（改文件即生效，无需重启）
     this.state = this._loadState();
     this.roundIndex = 0;
+    this.convMap = new Map(); // 对话键 → { conversationId, msgCount, ts }
     this._saveTimer = null;
     this._accountsFileMtime = 0;
     this._accountsFileAccounts = [];
@@ -186,25 +187,62 @@ export class DoubaoClient {
     });
   }
 
-  /** 健康检查：验证每个账号登录态 */
+  /**
+   * 健康检查：验证每个账号登录态。
+   * 注意：/alice/profile/self 对有效 Cookie 也会返回 code:710010202「系统错误」（实测 2026-11-13），
+   * 网页端调用它时额外带了 msToken/a_bogus 签名。改用无需签名的 quota/summary 判定登录态。
+   */
   async checkAll() {
     const results = [];
     for (const a of this._accounts()) {
       try {
-        const r = await fetch('https://www.doubao.com/alice/profile/self?aid=497858&version_code=20800', {
+        const r = await fetch('https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/?aid=497858&version_code=20800', {
           method: 'POST',
           headers: { 'content-type': 'application/json', cookie: a.cookie.trim(), 'user-agent': UA },
           body: '{}',
+          signal: this._withTimeout(),
         });
         const t = await r.text();
-        const ok = r.ok && /"code":\s*0/.test(t) && !/<html/i.test(t.slice(0, 200));
-        results.push({ id: a.id, remark: a.remark || '', ok, http: r.status });
-        if (!ok && r.status === 401) this.markAuthError(a, 'profile/self 401');
+        let code = null;
+        try { code = JSON.parse(t).code; } catch (e) { /* HTML 等非 JSON */ }
+        const ok = r.ok && code === 0 && !/<html/i.test(t.slice(0, 200));
+        results.push({ id: a.id, remark: a.remark || '', ok, http: r.status, code });
+        if (ok) {
+          const st = this._accState(a.id);
+          st.authError = false;
+        } else if (r.status === 401 || code === 401) {
+          this.markAuthError(a, 'quota/summary 登录态失效');
+        }
       } catch (e) {
         results.push({ id: a.id, remark: a.remark || '', ok: false, error: e.message });
       }
     }
     return results;
+  }
+
+  // ---------- 多轮上下文（conversation_id 复用，实测有效） ----------
+
+  /**
+   * 判断某对话能否复用已有 conversation_id。
+   * 仅在消息「严格追加一条」时复用；历史被改写/压缩就新建，避免上下文错位。
+   */
+  reusableConversation(key, msgCount) {
+    if (!key || this.cfg.contextReuse === false) return null;
+    const e = this.convMap.get(key);
+    if (!e) return null;
+    const ttlMs = (this.cfg.conversationTtlSec ?? 1800) * 1000;
+    if (Date.now() - e.ts > ttlMs) { this.convMap.delete(key); return null; }
+    if (msgCount !== e.msgCount + 1) return null;
+    return e.conversationId;
+  }
+
+  rememberConversation(key, conversationId, msgCount) {
+    if (!key || !conversationId) return;
+    this.convMap.set(key, { conversationId, msgCount, ts: Date.now() });
+    if (this.convMap.size > 100) {
+      const oldest = [...this.convMap.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
+      if (oldest) this.convMap.delete(oldest[0]);
+    }
   }
 
   // ---------- 模型目录 ----------
@@ -274,11 +312,11 @@ export class DoubaoClient {
     try { return JSON.parse(t); } catch (e) { throw new DoubaoError('upstream', '额度查询返回非 JSON'); }
   }
 
-  _buildBody(text, modelItemKey) {
+  _buildBody(text, modelItemKey, conversationId = '') {
     const now = Date.now();
     return {
       client_meta: {
-        local_conversation_id: 'gw_' + uuid(), conversation_id: '', bot_id: BOT_ID,
+        local_conversation_id: conversationId || ('gw_' + uuid()), conversation_id: conversationId, bot_id: BOT_ID,
         last_section_id: '', last_message_index: null, local_permissions: [],
       },
       messages: [{
@@ -292,7 +330,7 @@ export class DoubaoClient {
         click_clear_context: false, from_suggest: false, is_regen: false, is_replace: false,
         is_from_click_option: false, is_from_click_softlink: false, disable_sse_cache: false,
         select_text_action: '', is_select_text: false, resend_for_regen: false, scene_type: 0,
-        unique_key: uuid(), start_seq: 0, need_create_conversation: true,
+        unique_key: uuid(), start_seq: 0, need_create_conversation: !conversationId,
         conversation_init_option: { need_ack_conversation: true },
         conversation_init_ext: { model_item_key: modelItemKey, reasoning_effort: '3', mode_id: '3' },
         regen_query_id: [], edit_query_id: [], regen_instruction: '', no_replace_for_regen: false,
@@ -311,7 +349,7 @@ export class DoubaoClient {
    * 单账号单次上游调用
    * @returns {AsyncGenerator<string, string>} AI 文本增量（return 值为全文）
    */
-  async *chatOnce(account, modelItemKey, text, signal) {
+  async *chatOnce(account, modelItemKey, text, signal, conversationId = '') {
     const startedAt = Date.now();
     const st = this._accState(account.id);
     st.lastReqTimes = st.lastReqTimes || [];
@@ -331,7 +369,7 @@ export class DoubaoClient {
           referer: 'https://www.doubao.com/chat/',
           accept: 'text/event-stream',
         },
-        body: JSON.stringify(this._buildBody(text, modelItemKey)),
+        body: JSON.stringify(this._buildBody(text, modelItemKey, conversationId)),
         signal: this._withTimeout(signal),
       });
     } catch (e) {
@@ -358,6 +396,7 @@ export class DoubaoClient {
     let buf = '';
     let full = '';
     let ended = false;
+    let ackConv = '';
     try {
       while (!ended) {
         if (signal?.aborted) throw new DoubaoError('aborted', '请求已取消');
@@ -398,6 +437,11 @@ export class DoubaoClient {
                 const t = b?.content?.text_block?.text;
                 if (typeof t === 'string' && t) { full += t; yield t; }
               }
+            } else if (evName === 'SSE_ACK') {
+              // 记录服务端分配的 conversation_id，供下一轮复用上下文
+              const d = JSON.parse(dataStr);
+              const ci = d?.ack_client_meta?.conversation_info;
+              if (ci?.conversation_id) ackConv = String(ci.conversation_id);
             } else if (evName === 'SSE_REPLY_END' || evName === 'STREAM_FINISH' || evName === 'DONE') {
               ended = true;
             }
@@ -417,14 +461,14 @@ export class DoubaoClient {
     this.log('info', `上游完成 账号=${account.id} 字数=${full.length} 耗时=${ms}ms`, { acc: account.id, ms, chars: full.length });
 
     if (!full) throw new DoubaoError('empty', '上游未返回内容（可能触发风控/额度不足/参数被风）');
-    return full;
+    return { text: full, conversationId: ackConv || conversationId };
   }
 
   /**
    * 带账号池调度与重试的完整调用
    * @returns {AsyncGenerator<string, string>} AI 文本增量（return 值为全文）
    */
-  async *chat(modelId, text, signal) {
+  async *chat(modelId, text, signal, opts = {}) {
     const modelItemKey = this.resolveModelItemKey(modelId);
     if (!modelItemKey) throw new DoubaoError('upstream', `未知模型 ${modelId}`);
     const maxAttempts = Math.max(1, this.cfg.maxAttempts ?? 2);
@@ -450,7 +494,7 @@ export class DoubaoClient {
       }
       if (wait > 0) await new Promise(r => setTimeout(r, wait));
       try {
-        const full = yield* this.chatOnce(acc, modelItemKey, text, signal);
+        const full = yield* this.chatOnce(acc, modelItemKey, text, signal, opts.conversationId || '');
         return full;
       } catch (e) {
         if (e instanceof DoubaoError) {
