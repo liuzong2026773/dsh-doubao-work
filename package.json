@@ -15,6 +15,7 @@
     "doubao.js",
     "cordis.patch.yml",
     "tools",
+    "tests",
     "docs"
   ],
   "keywords": [
