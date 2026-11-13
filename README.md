@@ -93,6 +93,13 @@ dsh-doubao-work/
 
 `standalone/` 目录是同内核的独立 OpenAI 兼容网关（`node index.js`，默认 `127.0.0.1:3040/v1`），适合不想装插件、或想给其他 OpenAI 客户端/中转站供流的场景。配置 `config.json` + `accounts.json`（填 Cookie）后启动。
 
+## 内嵌设置页
+
+插件带浏览器半身（`client.js`），重启 DSH 后会在 **设置 → 模型接入** 里多出一页「豆包工作」，
+直接显示账号池、今日用量、预估剩余额度，并支持健康检查 / 启用停用 / 删除账号。
+
+数据来自宿主同源接口：`/doubao/status`、`/doubao/check`、`/doubao/account/enable|remove`。
+
 ## 本地面板
 
 ```bash
