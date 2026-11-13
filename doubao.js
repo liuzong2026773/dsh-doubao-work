@@ -396,6 +396,8 @@ export class DoubaoClient {
 
   _buildBody(text, modelItemKey, conversationId = '') {
     const now = Date.now();
+    // 推理档位：0 = 上游逐块流式；≥1 = 上游先推理完再整段返回（无流式体感）
+    const effort = Math.min(3, Math.max(0, Number(this.cfg.reasoningEffort ?? 0) || 0));
     return {
       client_meta: {
         local_conversation_id: conversationId || ('gw_' + uuid()), conversation_id: conversationId, bot_id: BOT_ID,
@@ -414,14 +416,14 @@ export class DoubaoClient {
         select_text_action: '', is_select_text: false, resend_for_regen: false, scene_type: 0,
         unique_key: uuid(), start_seq: 0, need_create_conversation: !conversationId,
         conversation_init_option: { need_ack_conversation: true },
-        conversation_init_ext: { model_item_key: modelItemKey, reasoning_effort: '3', mode_id: '3' },
+        conversation_init_ext: { model_item_key: modelItemKey, reasoning_effort: String(effort), mode_id: '3' },
         regen_query_id: [], edit_query_id: [], regen_instruction: '', no_replace_for_regen: false,
         message_from: 0, shared_app_name: '', shared_app_id: '',
         sse_recv_event_options: { support_chunk_delta: true }, support_lazy_fetch_stream: true,
         is_ai_playground: false, is_old_user: false, general_task_param: { server_do_compare: true },
         recovery_option: { is_recovery: false, req_create_time_sec: Math.floor(now / 1000), append_sse_event_scene: 0 },
         message_storage_type: 0, related_deleted_message_ids: {}, connector_info_list: [],
-        model_config: { model_item_key: modelItemKey, model_extra_params: {}, reasoning_effort: 3 },
+        model_config: { model_item_key: modelItemKey, model_extra_params: {}, reasoning_effort: effort },
         aggregate_params: {},
       },
     };

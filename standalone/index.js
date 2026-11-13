@@ -51,6 +51,7 @@ const CFG = {
   queueWaitMs: config.queueWaitMs ?? 30000,
   requestTimeoutMs: config.requestTimeoutMs ?? 180000,
   maxAttempts: config.maxAttempts ?? 2,
+  reasoningEffort: Math.min(3, Math.max(0, Number(config.reasoningEffort ?? 0) || 0)),
   upstream: {
     aid: '497858',
     version_code: '20800',
@@ -200,7 +201,7 @@ function messagesToText(messages) {
   return `以下是你（AI 助手）与用户的对话记录。请作为 AI 助手，直接回答用户最后一条消息，不要复述记录。\n\n${lines}\n\nAI:`;
 }
 
-function buildUpstreamBody(text, modelItemKey) {
+function buildUpstreamBody(text, modelItemKey, reasoningEffort) {
   const now = Date.now();
   const localConv = 'gw_' + uuid();
   const localMsg = uuid();
@@ -222,14 +223,14 @@ function buildUpstreamBody(text, modelItemKey) {
       select_text_action: '', is_select_text: false, resend_for_regen: false, scene_type: 0,
       unique_key: uuid(), start_seq: 0, need_create_conversation: true,
       conversation_init_option: { need_ack_conversation: true },
-      conversation_init_ext: { model_item_key: modelItemKey, reasoning_effort: '3', mode_id: '3' },
+      conversation_init_ext: { model_item_key: modelItemKey, reasoning_effort: String(reasoningEffort), mode_id: '3' },
       regen_query_id: [], edit_query_id: [], regen_instruction: '', no_replace_for_regen: false,
       message_from: 0, shared_app_name: '', shared_app_id: '',
       sse_recv_event_options: { support_chunk_delta: true }, support_lazy_fetch_stream: true,
       is_ai_playground: false, is_old_user: false, general_task_param: { server_do_compare: true },
       recovery_option: { is_recovery: false, req_create_time_sec: Math.floor(now / 1000), append_sse_event_scene: 0 },
       message_storage_type: 0, related_deleted_message_ids: {}, connector_info_list: [],
-      model_config: { model_item_key: modelItemKey, model_extra_params: {}, reasoning_effort: 3 },
+      model_config: { model_item_key: modelItemKey, model_extra_params: {}, reasoning_effort: reasoningEffort },
       aggregate_params: {},
     },
   };
@@ -238,7 +239,7 @@ function buildUpstreamBody(text, modelItemKey) {
 /** 调上游，返回 { ok, status, stream | error, kind } */
 async function upstreamChat(account, modelItemKey, text, signal) {
   const url = buildUrl();
-  const body = buildUpstreamBody(text, modelItemKey);
+  const body = buildUpstreamBody(text, modelItemKey, CFG.reasoningEffort);
   let res;
   try {
     res = await fetch(url, {

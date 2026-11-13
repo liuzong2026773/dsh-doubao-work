@@ -139,6 +139,19 @@ node tools/accounts.mjs export --out /tmp/backup.json
 - `POST /doubao/check` — 逐账号健康检查
 - `POST /doubao/account/add|enable|remove` — 账号增删启停
 
+## 流式输出与推理档位（reasoningEffort）
+
+实测豆包「工作模式」（`mode_id=3`）的推流行为取决于推理档位：
+
+- `0`（默认）：**真流式**——上游逐块推送，界面边生成边显示，体感最快；
+- `1`~`3`：**批推**——上游先推理完再一次性返回整段内容，没有流式体感，但复杂推理质量更高。
+
+抓包记录（同一账号、同一句提示词）：`reasoning_effort=0` 时首包后逐块到达（每块间隔几十～几百 ms）；
+`reasoning_effort=1/3` 时首包就是约 15KB 的完整回复。DSH 的「首 token / 输出速度」按总时长均摊，
+所以高推理档会显示成 ~11 tok/s 的"慢速"。
+
+- `reasoningEffort`（默认 `0`）：追求响应速度和流式体感保持 0；需要更强推理再调到 1~3。
+
 ## 多轮上下文（contextReuse）
 
 默认开启：同一段对话里，插件会复用豆包侧的 `conversation_id`，**只发最后一条消息**，
@@ -153,6 +166,8 @@ node tools/accounts.mjs export --out /tmp/backup.json
 
 ## 更新记录
 
+- **1.1.3**（2026-11-13）：新增 `reasoningEffort` 配置项（默认 0，走真流式）。此前写死为 3，
+  豆包工作模式在推理档 ≥1 时会先推理完再整段返回，导致界面"卡一下再出全文"、TTFT/TPS 统计偏低。
 - **1.1.2**（2026-11-13）：修复 `stream()` 中 `result` 变量作用域问题——此前每次生成完回复后都会抛
   `ReferenceError: result is not defined`，导致 DSH 把回合判为失败（表现为“豆包模型用不了”）。
 - **1.1.1**：改用 `/api/doubao/*` 接口前缀，兼容只派发 `/api` 的宿主。

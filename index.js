@@ -45,6 +45,7 @@ export const Config = Schema.object({
   providerId: Schema.string().description('DSH 中的 provider 路由名').default('doubao-work'),
   providerName: Schema.string().description('DSH 中显示的提供方名称').default('豆包工作（免费额度）'),
   extraModels: Schema.array(ExtraModelSchema).description('扩展模型（后续抓到新 model_item_key 可加）').default([]),
+  reasoningEffort: Schema.number().description('推理档位 0-3。0=真流式（推荐，边生成边到达）；1-3=先推理完再整段返回，质量更高但没有流式体感').min(0).max(3).default(0),
   contextReuse: Schema.boolean().description('复用豆包会话做多轮上下文（只在历史严格追加时复用，实测有效）').default(true),
   conversationTtlSec: Schema.number().description('会话复用有效期（秒），超时后新建会话').min(60).default(1800),
 });
