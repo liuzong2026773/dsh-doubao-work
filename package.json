@@ -1,0 +1,29 @@
+{
+  "name": "dsh-doubao-work",
+  "version": "1.0.0",
+  "type": "module",
+  "main": "index.js",
+  "description": "把豆包工作免费额度（DeepSeek V4.1 Flash / 豆包 2.1 Lite，0.01x）接入 DeepSeek Harness 的模型插件",
+  "files": [
+    "index.js",
+    "doubao.js",
+    "cordis.patch.yml"
+  ],
+  "keywords": [
+    "dsh-plugin",
+    "deepseek-harness",
+    "doubao",
+    "llm-adapter",
+    "free-models"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": ">=3.18.0",
+    "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1"
+  },
+  "license": "MIT",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}
