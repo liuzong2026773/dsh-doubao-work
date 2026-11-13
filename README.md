@@ -101,6 +101,14 @@ node tools/status.mjs --check  # 额外校验每个账号 Cookie 是否还有效
 node tools/status.mjs --quota  # 额外查询每个账号的订阅额度
 ```
 
+## 多轮上下文（contextReuse）
+
+默认开启：同一段对话里，插件会复用豆包侧的 `conversation_id`，**只发最后一条消息**，
+不再把历史拼成整段文本。仅在消息严格追加一条时复用，历史被改写/压缩则自动新建会话。
+
+- `contextReuse`（默认 `true`）：关掉就退回"每次新建会话 + 拼历史"的老行为
+- `conversationTtlSec`（默认 `1800`）：复用有效期，超时新建
+
 ## 接口实测记录
 
 抓包结论、模型 `model_item_key` 对照表、SSE 事件表、额度接口、以及**尚未抓到**的签到接口和补抓方法，见 [`docs/豆包接口实测-2026-11-13.md`](docs/豆包接口实测-2026-11-13.md)。
