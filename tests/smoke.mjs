@@ -28,6 +28,8 @@ const webServer = { register: (r) => { routes[r.path] = r; return () => {}; } };
 const ctx = {
   llm: { registerAdapter: (p) => { adapterProviders = p; } },
   get: (name) => (name === 'webServer' ? webServer : undefined),
+  // 模拟 cordis：服务已就绪时立即回调，并直接执行 effect 体
+  inject: (deps, cb) => cb({ webServer, effect: (fn) => { const d = fn(); return d; } }),
 };
 
 console.log('加载与注册');
