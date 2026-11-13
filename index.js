@@ -8,7 +8,7 @@
  * 任一请求 → Request Headers → 复制完整 Cookie 值，粘贴到插件配置的 cookie 字段。
  */
 
-import { Schema } from '@deepseek-ai/schemastery';
+import Schema from '@deepseek-ai/schemastery';
 import { LlmAdapter, LlmError } from '@deepseek-ai/dsh-llm';
 import { DoubaoClient, DoubaoError, BUILTIN_MODELS } from './doubao.js';
 import path from 'node:path';
