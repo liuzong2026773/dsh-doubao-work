@@ -11,7 +11,7 @@
 import { Schema, LlmAdapter, LlmError, resolvedFrom } from './host.js';
 import { dataPaths } from './paths.js';
 import { parseCookieInput, describeParse } from './cookie-input.js';
-import { candidateBrowsers, launchBrowser, grabDoubao, closeBrowser, loginAssist } from './browser.js';
+import { candidateBrowsers, launchBrowser, grabDoubao, closeBrowser, loginAssist, openCheckinPage } from './browser.js';
 import { DoubaoClient, DoubaoError, BUILTIN_MODELS, conversationKey } from './doubao.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -83,7 +83,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.5.1';
+export const VERSION = '1.5.2';
 
 /**
  * 配置默认值。
@@ -813,6 +813,41 @@ export function apply(ctx, rawConfig) {
               ok: true,
               ...browserHandle,
               hint: '已打开一个独立的浏览器窗口（临时配置，不影响你日常浏览）。在里面用手机号/扫码登录豆包，登录成功会自动导入，不用再点抓取。',
+            });
+          } catch (e) {
+            json(res, 500, { ok: false, error: String(e.message || e) });
+          }
+        },
+      });
+
+      // 用豆包客户端 UA 打开签到页：这一页只在客户端里给签到按钮（页面读 UA 尾巴的 SamanthaDoubao/<版本>）
+      register({
+        kind: 'exact',
+        path: '/doubao/checkin/open',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = (await parseBody(req)) || {};
+          try {
+            const list = client.allAccounts().filter(a => a.enabled !== false);
+            const acc = (typeof body.id === 'string' && list.find(a => a.id === body.id)) || list[0];
+            if (!acc) return json(res, 400, { ok: false, error: '没有可用账号（先导入一个 Cookie）' });
+            if (!browserHandle || !browserHandle.port) {
+              browserHandle = await launchBrowser({
+                browserId: typeof body.browserId === 'string' ? body.browserId : '',
+                browserPath: String(body.browserPath || config.browserPath || ''),
+                port: Number(body.port) || 0,
+                startUrl: 'about:blank',
+              });
+            }
+            const r = await openCheckinPage({ port: browserHandle.port, cookie: acc.cookie });
+            json(res, r.ok ? 200 : 500, {
+              ...r,
+              account: acc.id,
+              hint: r.ok
+                ? (r.hasCheckinButton
+                  ? '已用豆包客户端身份打开签到页，直接点「立即签到」。'
+                  : '页面打开了，但没看到签到按钮——这个号的 Cookie 可能已失效，先在面板里更新 Cookie。')
+                : '浏览器窗口没连上，重试一次或先点「从浏览器导入」把窗口拉起来。',
             });
           } catch (e) {
             json(res, 500, { ok: false, error: String(e.message || e) });

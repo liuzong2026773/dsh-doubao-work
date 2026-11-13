@@ -688,3 +688,82 @@ export async function loginAssist(opts = {}, deps = {}) {
     cdp.close();
   }
 }
+
+// ---------------- 打开「免费用豆包工作」签到页（伪装客户端 UA） ----------------
+
+/** 这一页只在豆包客户端里给签到按钮：页面读 UA 尾巴里的 SamanthaDoubao/<版本> */
+export const CHECKIN_PAGE_URL = 'https://www.doubao.com/pc/agent-explore?enter_method=fixed_entry';
+export const CLIENT_UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 SamanthaDoubao/2.35.12';
+
+/**
+ * 在已拉起的浏览器里把 UA 换成客户端 UA、注入 Cookie，然后打开签到页。
+ * 等价于"用豆包内置浏览器打开"，但人在普通浏览器里就能点。
+ */
+export async function openCheckinPage(opts = {}, deps = {}) {
+  const d = makeDeps(deps);
+  const port = Number(opts.port) || 0;
+  const probe = await probeDebugPort(port, deps, 1500);
+  if (!probe.ok) return { ok: false, stage: 'probe', reason: `127.0.0.1:${port} 没有响应（${probe.reason}）` };
+
+  const listRes = await d.fetchImpl(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) });
+  const targets = await listRes.json();
+  const page = (targets || []).find(t => t.type === 'page');
+  if (!page?.webSocketDebuggerUrl) return { ok: false, stage: 'target', reason: '没有可用的页面标签页' };
+
+  const ws = d.createSocket(page.webSocketDebuggerUrl);
+  const pending = new Map();
+  let seq = 0;
+  ws.addEventListener('message', (ev) => {
+    let msg;
+    try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch { return; }
+    if (msg.id && pending.has(msg.id)) {
+      const p = pending.get(msg.id);
+      pending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message || 'CDP 错误')); else p.resolve(msg.result);
+    }
+  });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('CDP 连接超时')), 6000);
+    ws.addEventListener('open', () => { clearTimeout(timer); resolve(); });
+    ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('CDP 连接被拒')); });
+  });
+  const send = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = ++seq;
+    pending.set(id, { resolve, reject });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+
+  try {
+    let injected = 0;
+    for (const pair of String(opts.cookie || '').split(';')) {
+      const i = pair.indexOf('=');
+      if (i < 1) continue;
+      try {
+        await send('Network.setCookie', {
+          name: pair.slice(0, i).trim(), value: pair.slice(i + 1).trim(),
+          domain: '.doubao.com', path: '/', url: 'https://www.doubao.com/', secure: true,
+        });
+        injected++;
+      } catch { /* 单条失败不影响整体 */ }
+    }
+    await send('Network.setUserAgentOverride', { userAgent: CLIENT_UA, platform: 'Win32' });
+    await send('Page.enable');
+    await send('Page.navigate', { url: opts.url || CHECKIN_PAGE_URL });
+    await new Promise(r => setTimeout(r, Number(opts.waitMs) || 8000));
+    const r = await send('Runtime.evaluate', {
+      expression: `(() => {
+        const btns = [...document.querySelectorAll('button')].map(b => (b.textContent || '').trim()).filter(Boolean);
+        return { buttons: btns.slice(0, 10), text: (document.body.innerText || '').replace(/\n+/g, ' | ').slice(0, 300) };
+      })()`,
+      returnByValue: true,
+    });
+    const v = r.result?.value || {};
+    return {
+      ok: true, injected, url: opts.url || CHECKIN_PAGE_URL,
+      buttons: v.buttons || [], text: v.text || '',
+      hasCheckinButton: (v.buttons || []).some(b => /签到/.test(b)),
+    };
+  } finally {
+    try { ws.close(); } catch { /* ignore */ }
+  }
+}

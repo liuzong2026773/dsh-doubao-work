@@ -58,6 +58,7 @@ ok('注册了预期路由集合（18 精确 + 1 /api 前缀）', () => {
     '/doubao/browser/launch',
     '/doubao/check',
     '/doubao/checkin',
+    '/doubao/checkin/open',
     '/doubao/checkin/status',
     '/doubao/models/probe',
     '/doubao/browser/login',

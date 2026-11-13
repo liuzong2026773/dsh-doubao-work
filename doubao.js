@@ -422,13 +422,21 @@ export class DoubaoClient {
     if (http === 401 || (data && data.code === 401)) throw new DoubaoError('auth', '签到状态查询：登录态失效');
     if (!data || data.code !== 0) {
       const code = data && data.code !== undefined ? data.code : http;
-      throw new DoubaoError('upstream', `签到状态查询失败 code=${code} ${(data && (data.message || data.msg)) || ''}`.trim());
+      // code=1 invalid param / 数据为空：活动配置在服务端没了（跨天重置、活动下线、接口变更都会这样），
+      // 此时豆包客户端里那一页同样打不开，不是本插件的问题，如实回报即可。
+      return {
+        checkedInToday: false,
+        reward: null,
+        available: false,
+        code,
+        reason: `活动接口暂不可用（code=${code} ${(data && (data.message || data.msg)) || ''}）`.trim(),
+      };
     }
     const tasks = Array.isArray(data.data && data.data.tasks) ? data.data.tasks : [];
     const task = tasks.find(t => t && (t.daily_checkin || t.dailyCheckin)) || tasks[0] || null;
     const ck = task ? (task.daily_checkin || task.dailyCheckin) : null;
     const checkedInToday = ck ? !!(ck.checked_in_today !== undefined ? ck.checked_in_today : ck.checkedInToday) : false;
-    return { checkedInToday, reward: ck ? (ck.reward || null) : null };
+    return { checkedInToday, reward: ck ? (ck.reward || null) : null, available: true };
   }
 
   /**
@@ -439,6 +447,16 @@ export class DoubaoClient {
     const st = this._accState(account.id);
     const today = dayKeyCN();
     const status = await this.getCheckinStatus(account);
+    if (status.available === false) {
+      // 活动本身不可用：不发 checkin（发了也是 710010702，还白挨风控），也不记成"失败"，
+      // 免得当天再也不重试——活动恢复后下一次点还能签。
+      st.checkinDay = today;
+      st.checkinAt = Date.now();
+      st.checkinResult = 'unavailable';
+      st.lastError = status.reason;
+      this._scheduleSave();
+      return { id: account.id, remark: account.remark || '', result: 'unavailable', code: status.code, error: status.reason };
+    }
     if (status.checkedInToday) {
       st.checkinDay = today;
       st.checkinAt = Date.now();
@@ -446,7 +464,7 @@ export class DoubaoClient {
       this._scheduleSave();
       return { id: account.id, remark: account.remark || '', result: 'already', reward: status.reward };
     }
-    if (st.checkinDay === today && st.checkinResult === 'failed') {
+    if (st.checkinDay === today && (st.checkinResult === 'failed' || st.checkinResult === 'unavailable')) {
       return { id: account.id, remark: account.remark || '', result: 'skipped', error: st.lastError || '今日签到已失败，跳过重试' };
     }
     const { http, data } = await this._postCampaign(account, '/alice/ug/campaign/landing/checkin', { scene: CHECKIN_SCENE });
@@ -454,18 +472,25 @@ export class DoubaoClient {
     const ok = http === 200 && code === 0;
     const title = (data && data.data && ((data.data.complete_page_info || {}).title || (data.data.toast || {}).text)) || '';
     const msg = (data && (data.message || data.msg)) || '';
+    // 710010702 = 服务端"系统错误"，豆包客户端里点同样如此，重试只会挨风控
+    const unavailable = code === 710010702;
     st.checkinDay = today;
     st.checkinAt = Date.now();
-    st.checkinResult = ok ? 'ok' : 'failed';
-    if (!ok) st.lastError = `签到失败 code=${code} ${msg}`.trim();
+    st.checkinResult = ok ? 'ok' : (unavailable ? 'unavailable' : 'failed');
+    if (!ok) {
+      st.lastError = unavailable
+        ? '活动接口暂不可用（服务端 710010702，豆包客户端内点也一样）'
+        : `签到失败 code=${code} ${msg}`.trim();
+    }
     this._scheduleSave();
     return {
       id: account.id,
       remark: account.remark || '',
-      result: ok ? 'ok' : 'failed',
+      result: st.checkinResult,
       code,
       title,
-      error: ok ? '' : `code=${code} ${msg}`.trim(),
+      error: ok ? '' : st.lastError,
+      rewarded: unavailable ? 0 : undefined,
       reward: status.reward,
     };
   }

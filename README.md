@@ -401,6 +401,19 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 
 ## 更新记录
 
+- **1.5.2**（2026-11-14，签到真相 + 伪装客户端打开签到页）：
+  - **查清了「签到失败」到底是谁的问题**：接进电脑版豆包（Chromium 147，`--remote-debugging-port=9222`）后，
+    在它自带的 webview 里点「立即签到」，服务器返回的仍是 `710010702 系统错误`——和插件发的一模一样，
+    请求体都是 `{"scene":"pc_incentive_task_mvp_v3"}`。所以失败不在插件、也不在代理，是服务端在拒。
+    跨 0 点后连状态接口 `/alice/ug/campaign/v3/detail/` 都变成 `code=1 invalid param`（同一份参数当天早些时候还返回奖励配置）。
+  - **新增「打开签到页」**：那一页只在豆包客户端里给签到按钮，判断依据是 UA 尾巴上的
+    `SamanthaDoubao/<版本>`（实测客户端 webview 的 UA 是 `… Chrome/147.0.0.0 Safari/537.36 SamanthaDoubao/2.35.12`）。
+    现在用 CDP 改 UA + 注入 Cookie，普通浏览器窗口里也能打开
+    `https://www.doubao.com/pc/agent-explore?enter_method=fixed_entry` 并看到「立即签到」。
+    面板加了按钮，接口 `POST /doubao/checkin/open`，命令行 `node tools/open-checkin.mjs`。
+  - **签到状态不再笼统记"失败"**：活动接口不可用（`code=1` / `710010702`）时记为 `unavailable`，
+    面板显示「活动暂不可用」，当天不再重复打接口（打也是硬拒，还白挨风控），活动恢复后能重新签。
+- **1.5.1**
 - **1.5.1**（2026-11-13，模型切换 + 两处误判）：
   - **选了模型不生效（P0，已修）**：抓了网页版工作模式的真实请求，模型是 `option.need_deep_think`
     （模型 `item_id`，4.1 flash = 10001）决定的，`model_item_key` 只作辅助。之前只发 key，
@@ -534,7 +547,7 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
     （本轮是否复用、从第几条开始发、总条数），用于核对"我切了模型，宿主到底下发了什么"。
   - **一键签到（新增）**：`client.checkin()` / `checkinAll()` / `getCheckinStatus()`，走上游
     `POST /alice/ug/campaign/landing/checkin`（`scene: pc_incentive_task_mvp_v3`），配套
-    `/v3/detail/` 读 `checked_in_today`；新增路由 `/doubao/checkin`、`/doubao/checkin/status`
+    `/v3/detail/` 读 `checked_in_today`；新增路由 `/doubao/checkin`、`/doubao/checkin/open`、`/doubao/checkin/status`
     （同源 + 回环 + `adminToken` 守卫），面板增「一键签到」按钮与 `/api/checkin`。
     注：2026-11-13 实测该接口服务端返回 `710010702 系统错误`（人工点击同样如此），属上游侧问题。
   - **面板 `contextReuse` 不再硬编码 `true`**：改为读实际配置，关掉复用时面板不再显示"开"。

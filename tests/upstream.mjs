@@ -308,12 +308,13 @@ await ok('当日已签：判 already 且不打 checkin 接口', async () => {
   assert.deepEqual(campaignHits().slice(before), ['/alice/ug/campaign/v3/detail/'], '已签不应再打签到接口');
 });
 
-await ok('服务端硬拒：记 failed，同日不再重打', async () => {
+await ok('服务端硬拒 710010702：记 unavailable（不是 failed），同日不再重打', async () => {
   resetCampaign({ checkedIn: false, checkinCode: 710010702 });
   const c = makeClient([acc('a1', COOKIE_A)]);
   const before = campaignHits().length;
   const first = await c.checkin(acc('a1', COOKIE_A));
-  assert.equal(first.result, 'failed');
+  assert.equal(first.result, 'unavailable');
+  assert.match(first.error, /710010702/);
   assert.equal(first.code, 710010702);
   assert.equal(campaignHits().slice(before).filter(p => p.endsWith('/landing/checkin')).length, 1);
   const again = await c.checkin(acc('a1', COOKIE_A));
@@ -321,10 +322,14 @@ await ok('服务端硬拒：记 failed，同日不再重打', async () => {
   assert.equal(campaignHits().slice(before).filter(p => p.endsWith('/landing/checkin')).length, 1, '今日已失败，不应再打');
 });
 
-await ok('状态接口异常：checkin 抛出 upstream 错误', async () => {
-  resetCampaign({ detailCode: 710010202 });
+await ok('活动配置在服务端没了（detail code=1）：判 unavailable，且不发 checkin', async () => {
+  resetCampaign({ detailCode: 1 });
   const c = makeClient([acc('a1', COOKIE_A)]);
-  await assert.rejects(c.checkin(acc('a1', COOKIE_A)), (e) => e instanceof DoubaoError && e.kind === 'upstream');
+  const before = campaignHits().length;
+  const r = await c.checkin(acc('a1', COOKIE_A));
+  assert.equal(r.result, 'unavailable');
+  assert.match(r.error, /暂不可用/);
+  assert.equal(campaignHits().slice(before).filter(p => p.endsWith('/landing/checkin')).length, 0, '活动不可用时不该再打签到接口');
 });
 
 await ok('登录态失效：标 authError 并在汇总里记 error', async () => {

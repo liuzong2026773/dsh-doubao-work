@@ -27,6 +27,7 @@ window.__ModuleLoader__.load({
     const api = {
       status: () => req('/api/doubao/status', { cache: 'no-store' }),
       check: () => req('/api/doubao/check', { method: 'POST' }),
+      checkinOpen: (body) => req('/api/doubao/checkin/open', { method: 'POST', body }),
       checkin: (body) => req('/api/doubao/checkin', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}),
       }),
@@ -138,6 +139,16 @@ window.__ModuleLoader__.load({
             + (bad.length ? '\n' + bad.map(x => '- ' + x.id + '：' + (x.error || '失败')).join('\n') : ''))
         } catch (e) { setLog('签到失败：' + (e.message || e)) }
         setBusy(''); load()
+      }
+      // 打开签到页：普通窗口里伪装成豆包客户端（UA 带 SamanthaDoubao），页面才给签到按钮
+      const onOpenCheckin = async () => {
+        setBusy('open-checkin')
+        setLog('正在用豆包客户端身份打开签到页…')
+        try {
+          const r = await api.checkinOpen({})
+          setLog(r.hint || (r.ok ? '已打开签到页' : '打开失败'))
+        } catch (e) { setLog('打开签到页失败：' + (e.message || e)) }
+        setBusy('')
       }
       const onToggle = async a => { setBusy(a.id); try { await api.enable(a.id, !a.enabled) } catch (e) {} setBusy(''); load() }
       const openAdd = () => { setFormMode('add'); setForm({ id: '', remark: '', cookie: '' }); setShowAdd(true) }
@@ -288,6 +299,7 @@ window.__ModuleLoader__.load({
           h('button', { style: S.btn, onClick: load, disabled: !!busy }, '刷新'),
           h('button', { style: S.btn, onClick: onCheck, disabled: !!busy }, busy === 'check' ? '检查中…' : '全部健康检查'),
           h('button', { style: S.btn, onClick: () => onCheckin(), disabled: !!busy }, busy === 'checkin' ? '签到中…' : '一键签到'),
+          h('button', { style: { ...S.btn, marginLeft: 6 }, disabled: !!busy, onClick: () => onOpenCheckin() }, '打开签到页'),
           h('button', { style: S.btn, onClick: () => (showAdd ? setShowAdd(false) : openAdd()) }, showAdd ? '收起' : '添加账号'),
           h('button', { style: S.btn, onClick: onBrowserLaunch, disabled: !!busy }, busy === 'browser' ? '打开中…' : '从浏览器导入'),
           h('button', { style: S.btn, onClick: () => (syncMode ? (setSyncMode(null), setSyncText('')) : onExport()), disabled: !!busy }, syncMode ? '收起账号包' : '导出/导入账号')),
@@ -373,7 +385,11 @@ window.__ModuleLoader__.load({
             : accounts.map(a => h('tr', { key: a.id },
               h('td', { style: S.td }, a.remark || a.id),
               h('td', { style: { ...S.td, color: statusColor(a.status) } }, String(a.status),
-                a.checkinToday ? h('span', { style: { ...S.mute, color: a.checkinToday === 'failed' ? '#c0392b' : 'inherit' } }, a.checkinToday === 'failed' ? '｜签到失败' : '｜今日已签') : null),
+                a.checkinToday ? h('span', { style: { ...S.mute, color: a.checkinToday === 'failed' ? '#c0392b' : 'inherit' } },
+                  a.checkinToday === 'failed' ? '｜签到失败'
+                    : a.checkinToday === 'unavailable' ? '｜活动暂不可用'
+                    : a.checkinToday === 'ok' ? '｜今日已签'
+                    : '') : null),
               h('td', { style: S.td }, String(a.todayReq ?? 0)),
               h('td', { style: S.td }, String(a.quotaLeftEst ?? 0)),
               h('td', { style: S.td }, String(a.totalChars ?? 0)),
