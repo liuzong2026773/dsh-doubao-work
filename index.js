@@ -45,6 +45,8 @@ export const Config = Schema.object({
   providerId: Schema.string().description('DSH 中的 provider 路由名').default('doubao-work'),
   providerName: Schema.string().description('DSH 中显示的提供方名称').default('豆包工作（免费额度）'),
   extraModels: Schema.array(ExtraModelSchema).description('扩展模型（后续抓到新 model_item_key 可加）').default([]),
+  contextReuse: Schema.boolean().description('复用豆包会话做多轮上下文（只在历史严格追加时复用，实测有效）').default(true),
+  conversationTtlSec: Schema.number().description('会话复用有效期（秒），超时后新建会话').min(60).default(1800),
 });
 
 // ---------------- OpenAI Message → 豆包文本 ----------------
@@ -121,7 +123,17 @@ class DoubaoLlmAdapter extends LlmAdapter {
   async *stream(options) {
     const { client, log } = this.deps;
     const model = options.model;
-    const text = messagesToText(options);
+
+    // 多轮上下文：同一段对话（首条用户消息不变、消息严格追加）时复用豆包会话，
+    // 只发最后一条，不必每次把历史拼成整段文本。
+    const msgs = options.messages || [];
+    const firstUser = msgs.find(m => m.role === 'user');
+    const firstText = firstUser ? blockText(firstUser.content) : '';
+    const convKey = firstText ? model + '|' + firstText.slice(0, 200) : '';
+    const reuseId = client.reusableConversation(convKey, msgs.length);
+    const lastMsg = msgs[msgs.length - 1];
+    const lastText = lastMsg ? blockText(lastMsg.content) : '';
+    const text = reuseId && lastText ? lastText : messagesToText(options);
     if (options.tools?.length) {
       log('warn', `豆包工作接口不支持工具调用（本次请求带 ${options.tools.length} 个工具，已忽略）。该模型适合对话/写作类任务，不适合做 Agent 主循环模型。`);
     }
@@ -131,10 +143,11 @@ class DoubaoLlmAdapter extends LlmAdapter {
     let full = '';
     let first = true;
     try {
-      const gen = client.chat(model, text, signal);
+      const gen = client.chat(model, text, signal, { conversationId: reuseId || '' });
+      let result = null;
       while (true) {
         const { value: delta, done } = await gen.next();
-        if (done) { full = delta || full; break; }
+        if (done) { result = delta; full = delta?.text || full; break; }
         if (first) {
           yield { type: 'block-start', index: 0, blockType: 'text' };
           first = false;
@@ -153,6 +166,9 @@ class DoubaoLlmAdapter extends LlmAdapter {
       // 没有任何增量就结束了
       throw new LlmError('豆包上游未返回内容', 'UPSTREAM_ERROR');
     }
+
+    // 记住服务端分配的会话号，供下一轮复用
+    if (result?.conversationId) client.rememberConversation(convKey, result.conversationId, msgs.length);
 
     yield { type: 'block-end', index: 0, block: { type: 'text', text: full } };
     yield {
