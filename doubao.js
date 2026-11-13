@@ -40,15 +40,18 @@ export const BUILTIN_MODELS = [
 export class DoubaoClient {
   /**
    * @param config 插件配置（accounts/strategy/rpm/...）
-   * @param opts {{ statePath?: string, log?: (level: string, msg: string, extra?: object) => void }}
+   * @param opts {{ statePath?: string, accountsPath?: string, log?: (level: string, msg: string, extra?: object) => void }}
    */
   constructor(config, opts = {}) {
     this.cfg = config;
     this.log = opts.log || (() => {});
     this.statePath = opts.statePath;
+    this.accountsPath = opts.accountsPath; // accounts.json 热加载（改文件即生效，无需重启）
     this.state = this._loadState();
     this.roundIndex = 0;
     this._saveTimer = null;
+    this._accountsFileMtime = 0;
+    this._accountsFileAccounts = [];
   }
 
   // ---------- 运行状态（冷却/统计独立持久化，不混入配置） ----------
@@ -82,8 +85,46 @@ export class DoubaoClient {
 
   // ---------- 账号池 ----------
 
+  /**
+   * 热加载 accounts.json（存在时）：mtime 变化才重读。
+   * 文件格式：{ "accounts": [ { "id": "acc-1", "cookie": "...", "remark": "...", "enabled": true } ] }
+   * 同 id 时文件账号优先于配置面板账号；导出=复制此文件，导入=放到插件目录。
+   */
+  _syncAccountsFile() {
+    if (!this.accountsPath) return;
+    let st;
+    try {
+      st = fs.statSync(this.accountsPath);
+    } catch (e) {
+      if (e.code === 'ENOENT' && this._accountsFileAccounts.length) {
+        this._accountsFileAccounts = [];
+        this._accountsFileMtime = 0;
+        this.log('info', 'accounts.json 已移除，回退到配置面板账号');
+      }
+      return;
+    }
+    if (st.mtimeMs === this._accountsFileMtime) return;
+    this._accountsFileMtime = st.mtimeMs;
+    try {
+      const raw = fs.readFileSync(this.accountsPath, 'utf8').replace(/^\uFEFF/, ''); // 容错 UTF-8 BOM
+      const data = JSON.parse(raw);
+      const list = Array.isArray(data) ? data : (data.accounts || []);
+      this._accountsFileAccounts = list
+        .map((a, i) => ({ ...a, id: a.id || `file-acc-${i + 1}` }))
+        .filter(a => typeof a.cookie === 'string' && a.cookie.trim().length > 0);
+      this.log('info', `accounts.json 已加载：${this._accountsFileAccounts.length} 个账号（文件账号优先）`);
+    } catch (e) {
+      this.log('warn', 'accounts.json 解析失败（沿用上次的账号）: ' + e.message);
+    }
+  }
+
   _accounts() {
-    return (this.cfg.accounts || []).filter(a => a.enabled !== false && typeof a.cookie === 'string' && a.cookie.trim().length > 20);
+    this._syncAccountsFile();
+    const configAccounts = (this.cfg.accounts || []).map((a, i) => ({ ...a, id: a.id || `acc-${i + 1}` }));
+    const merged = new Map();
+    for (const a of configAccounts) merged.set(a.id, a);
+    for (const a of this._accountsFileAccounts) merged.set(a.id, a); // 同 id 文件优先
+    return [...merged.values()].filter(a => a.enabled !== false && typeof a.cookie === 'string' && a.cookie.trim().length > 20);
   }
 
   _validAccounts() {
