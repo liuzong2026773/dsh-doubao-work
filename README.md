@@ -98,6 +98,14 @@ dsh-doubao-work/
 插件带浏览器半身（`client.js`），重启 DSH 后会在 **设置 → 模型接入** 里多出一页「豆包工作」，
 直接显示账号池、今日用量、预估剩余额度，并支持健康检查 / 启用停用 / 删除账号。
 
+页面上还能「添加账号」（直接粘贴整段 Cookie，保存即生效）与「启用/停用/删除」。
+
+离线自检（不重启、不耗额度）：
+
+```bash
+node tests/smoke.mjs     # 契约/路由/接口/会话闸门，共 10 项
+```
+
 数据来自宿主同源接口：`/doubao/status`、`/doubao/check`、`/doubao/account/enable|remove`。
 
 ## 本地面板
