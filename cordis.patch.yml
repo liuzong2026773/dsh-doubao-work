@@ -1,2 +1,8 @@
-plugins:
-  - require: ./index.js
+# dsh-doubao-work bundle patch —— 把插件行插入 profile 花名册。
+#
+# DSH 的 bundle overlay 必须是顶层 loader patch 数组（不是 cordis 的
+# `plugins: - require:` 老格式）。`name` 用裸包名，让 exports "." 解析到
+# index.js（host 半身），由它注册 `doubao-work` provider。
+- insert:
+    - id: doubao-work
+      name: 'dsh-doubao-work'
