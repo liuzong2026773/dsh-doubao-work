@@ -163,6 +163,17 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
 - `POST /doubao/check` — 逐账号健康检查
 - `POST /doubao/account/add|update|enable|remove` — 账号增删改启停（`update` 用于换 Cookie，不用删了再加）
 
+**访问控制**：带 `Origin` 的浏览器请求必须同源；不带 `Origin` 的调用只放行本机（`127.0.0.1` / `::1`）。
+需要从别的机器调管理接口时，在配置里设 `adminToken`，并带上请求头：
+
+```bash
+curl -X POST http://<host>:<port>/doubao/account/add \
+  -H 'x-doubao-admin-token: <你的 adminToken>' \
+  -H 'content-type: application/json' -d '{"account":"...","cookie":"..."}'
+```
+
+`adminToken` 留空 = 只允许本机调用（默认，最安全）。
+
 ## 流式输出与推理档位（reasoningEffort）
 
 实测豆包「工作模式」（`mode_id=3`）的推流行为取决于推理档位：
@@ -205,13 +216,61 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 
 ## 待办 / 已知缺口
 
-- `standalone/` 独立网关是**同逻辑的另一份实现**，尚未同步 1.2.0 的流中断保护与错误码修正，
-  后续应改为直接复用 `doubao.js`，避免两处漂移。
+- `standalone/` 独立网关是**同逻辑的另一份实现**，1.2.2 已同步流中断保护（截断时 `finish_reason: length`
+  并记 warn），但**仍不支持 function calling**。后续应改为直接复用 `doubao.js`，避免两处漂移。
 - 8 个未抓 `model_item_key`（豆包 2.1 Pro / Kimi K3 / GLM 5.3 等），抓到即可加进 `extraModels`。
 - 签到接口在网页端不存在（详见 docs），插件侧只能做额度记账与提醒，无法自动签到。
 
 ## 更新记录
 
+- **1.2.3**（2026-11-13）：
+  - **每轮都开新会话（P1，已修）**：`reusableConversation()` 要求历史条数**严格 +1** 才复用上游会话，而宿主每轮
+    会重排消息、重注入 system/上下文块，条数几乎总在跳变，于是每一轮都整段重发、上游每次新建会话——表现就是
+    "同一个对话里每轮都失忆"。新增 `planReuse()`：只要 ① 复用键一致且在 TTL 内 ② 条数**没有回退**
+    ③ 上一条 assistant 内容与本插件上次返回一致（防宿主换分支/串号），就判定为同一段对话，
+    只补发「上次之后真正的新消息」。条数回退（历史被截断/压缩）时仍整段重发，避免丢上下文。
+  - **补发起点修正（P1）**：复用时的起点会跳过上一轮由上游生成的 assistant 回复，否则会把自己的回复
+    当成用户输入再发一遍，模型会"复读"自己的话。
+  - **切换模型即断上下文（P1，已修）**：`conversationKey()` 此前把模型名拼进复用键，模型一换键就变，
+    上下文必然断。现只按「首条消息全文长度 + SHA1」计算，模型只影响上游 `model_item_key`。
+  - **模型映射更宽容 + 可诊断（P2）**：`resolveModelItemKey()` 支持大小写/空格/下划线差异，以及宿主偶尔
+    下发的 `provider/model` 整串（取末段再匹配一次）；未知模型报错里直接列出本插件支持的模型 id；
+    每次调用记一条 `模型映射 x -> y` 日志；`/doubao/status` 新增 `lastModel` / `lastModelAt` / `lastReuse`
+    （本轮是否复用、从第几条开始发、总条数），用于核对"我切了模型，宿主到底下发了什么"。
+  - **一键签到（新增）**：`client.checkin()` / `checkinAll()` / `getCheckinStatus()`，走上游
+    `POST /alice/ug/campaign/landing/checkin`（`scene: pc_incentive_task_mvp_v3`），配套
+    `/v3/detail/` 读 `checked_in_today`；新增路由 `/doubao/checkin`、`/doubao/checkin/status`
+    （同源 + 回环 + `adminToken` 守卫），面板增「一键签到」按钮与 `/api/checkin`。
+    注：2026-11-13 实测该接口服务端返回 `710010702 系统错误`（人工点击同样如此），属上游侧问题。
+  - **面板 `contextReuse` 不再硬编码 `true`**：改为读实际配置，关掉复用时面板不再显示"开"。
+- **1.2.2**（2026-11-13）：
+  - **管理接口守卫收紧**（P1）：此前 `sameOrigin` 的逻辑是「没有 `Origin` 头就放行」，等于只防住了浏览器
+    跨源请求（CSRF）；任何本机进程、或插件监听 `0.0.0.0` 时同网段的机器，都能直接 `POST` 增删账号。
+    现在改为：带 `Origin` 必须同源；不带 `Origin` 只放行回环地址（`127.0.0.1` / `::1` / `::ffff:127.0.0.1`），
+    跨机调用必须携带新增配置项 `adminToken` 对应的 `x-doubao-admin-token` 头（等长逐字节比较，不按前缀提前返回）。
+    本机调用与同源浏览器访问不受影响。
+  - **面板同源校验 + 注入修复**（P1）：`tools/panel.mjs` 的写接口此前**完全没有**同源校验，任意网页都能对
+    `127.0.0.1:3000` 发 `POST` 增删账号；现已补上。同时账号 `id` 此前直接拼进内联 `onclick`，
+    `id` 里若带单引号可跳出 JS 字符串——注意把 `'` 转成 `&#39;` **并不能**解决问题（浏览器解析属性时会还原成 `'`），
+    现改为先 `JSON.stringify` 成字符串字面量再做属性转义，`esc` 也补齐了 `"` 与 `'`。
+  - **会话复用不再串号**（P2）：复用键此前是「模型名 + 首条消息前 200 字」，两个不同会话只要开头相同
+    （比如都以"帮我看下这段代码"起头）就会共用同一条上游会话，回答互相串。改为 `conversationKey()`
+    （全文长度 + 全文 SHA1 前 16 位）。局限照旧：宿主未暴露 session id，首条消息完全相同的两段对话仍无法区分。
+  - **不再接管 `SIGINT`**（P2）：此前插件在 `apply` 里注册 `SIGINT` 并 `flush` 后 `process.exit(0)`，
+    等于插件替宿主决定 Ctrl+C 的行为，且每次热重载都会累积监听器。现只注册一次进程级 `exit` 落盘钩子。
+  - **`usage.inputTokens` 按全量上下文估算**（P2）：复用会话时本次只发最后一条，但上游计费覆盖整段上下文，
+    此前只按最后一条估算，统计偏低。
+  - **standalone 同步**（P2）：流解析函数返回 `{ text, truncated }`，断流时 `finish_reason` 如实标为 `length`
+    并记 warn 日志，不再把半截回复当成完整回复返回。
+  - **`engines`**：补 `node: >=20`（用到 `crypto.randomUUID`、`node:` 前缀导入等）。
+- **1.2.1**（2026-11-13）：
+  - **配置项补齐**：`baseUrl` / `requestTimeoutMs` / `globalMaxConcurrency` / `queueWaitMs` /
+    `dailyQuota` / `upstream`（设备参数）此前只在 `doubao.js` 里读取、未在 `Config` Schema 声明，
+    导致配置面板改不了、README 里"经 `baseUrl` 替换上游"实际做不到。现已全部登记，保守默认值不变。
+  - **推送脚本修复**：`tools/git-api-push.mjs` 的删除检测写在了 `fs.readFileSync` 之后，
+    工作区里已删、索引仍收录的文件会先抛 `ENOENT`，`sha: null` 的删除分支永远走不到。已调整顺序。
+  - **可执行位保留**：推送时 mode 改为从 `git ls-files -s` 读取真实值，不再硬编码 `100644`
+    （此前带 shebang 的脚本推上去会丢可执行位）。
 - **1.2.0**（2026-11-13）：
   - **停用账号重新可见**：此前 `enabled: false` 的账号会从设置页列表里消失，导致「停用」按下去就再也点不回来；
     现在快照含停用账号，按钮改为按 `enabled` 判断，显示「启用 / 停用」。
