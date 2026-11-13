@@ -468,8 +468,28 @@ export class DoubaoClient {
     return results;
   }
 
-  // ---------- 多轮上下文（conversation_id 复用，实测有效） ----------
+  /**
+   * 验证一个 model_item_key 是否被服务端接受并真正生效。
+   * 判据只看 SSE_ACK 里回写的 model_item_key（回写等于传入才算生效），不看模型自认知。
+   * 发的是最短的一句话，尽量少吃额度。
+   */
+  async probeModelKey(account, modelItemKey) {
+    const attempt = { text: '', conversationId: '', ackModelItemKey: '' };
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), Math.min(Number(this.cfg.requestTimeoutMs) || 60000, 60000));
+    try {
+      for await (const _ of this.chatOnce(account, modelItemKey, '嗨', ctrl.signal, '', attempt)) { /* 只关心 ack */ }
+      const echoed = attempt.ackModelItemKey || '';
+      return { ok: !!echoed && echoed === modelItemKey, echoed, text: attempt.text };
+    } catch (e) {
+      return { ok: false, echoed: attempt.ackModelItemKey || '', error: e.message };
+    } finally {
+      clearTimeout(timer);
+      try { ctrl.abort(); } catch { /* ignore */ }
+    }
+  }
 
+  // ---------- 多轮上下文（conversation_id 复用，实测有效） ----------
   /**
    * 判断某对话能否复用已有 conversation_id。
    * 仅在消息「严格追加一条」时复用；历史被改写/压缩就新建，避免上下文错位。
@@ -659,7 +679,7 @@ export class DoubaoClient {
     st.totalReq++;
     this._scheduleSave();
     // 记账对象：让上层看到"已输出多少 / 服务端会话号是多少"
-    const sink = attempt || { text: '', conversationId: '' };
+    const sink = attempt || { text: '', conversationId: '', ackModelItemKey: '' };
 
     /** 归类中止：区分"调用方取消"和"上游超时"，两者在 DSH 里处置方式不同 */
     const abortKind = (e) => {
@@ -770,6 +790,10 @@ export class DoubaoClient {
               const d = JSON.parse(dataStr);
               const ci = d?.ack_client_meta?.conversation_info;
               if (ci?.conversation_id) { ackConv = String(ci.conversation_id); sink.conversationId = ackConv; }
+              // 服务端在 ack 里回写实际生效的 model_item_key —— 抓新 key 时以它为准
+              //（别信模型自认知，壳层统一答“豆包”；见 docs/豆包接口实测-2026-11-13.md）
+              const echoed = ci?.extra?.model_item_key ?? ci?.extra?.modelItemKey ?? d?.ack_client_meta?.extra?.model_item_key;
+              if (echoed !== undefined && echoed !== null && echoed !== '') sink.ackModelItemKey = String(echoed);
             } else if (evName === 'SSE_REPLY_END' || evName === 'STREAM_FINISH' || evName === 'DONE') {
               ended = true;
             }

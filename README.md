@@ -98,7 +98,11 @@ Application 包装层的布局也认）。想用别的内核浏览器，在插�
 - **失败自动换号重试**；**流中断保护**：已经吐出内容后不再换号重发，避免用户看到重复文本
 - **错误码对齐宿主协议**：`QUOTA` / `RATE_LIMIT` / `AUTH` / `TRANSPORT` / `TIMEOUT` / `EMPTY_RESPONSE` /
   `ABORTED` / `SERVER`，并由 `providerRetryPolicy` 声明哪些错误宿主可以补一次重试
-- **扩展模型**：后续抓到新的 `model_item_key` 可在 `extraModels` 配置里加
+- **每日自动签到**（1.4.0）：面板「一键签到」（整池或单号）+ 配置 `checkinSchedule: "09:30"` 后每天自动签，
+  启动时若当天还没签会自动补一次
+- **账号包导出/导入**（1.4.0）：面板一键把全部账号导出成一段 JSON，换设备/传手机后粘贴导入
+- **扩展模型**：后续抓到新的 `model_item_key` 可在 `extraModels` 配置里加，
+  用 `node tools/model-probe.mjs --capture` 抓、`--key` 验证（见「运维小工具」）
 
 ## 多账号与 Cookie 导入/导出（accounts.json）
 
@@ -123,12 +127,21 @@ Application 包装层的布局也认）。想用别的内核浏览器，在插�
 
 - 每次调用前检查文件修改时间，**改完保存立即生效**（加号、换 Cookie、临时禁用 `enabled: false` 都不用重启）
 - 同 `id` 时文件账号优先于配置面板账号
-- **导出**：复制这个 `accounts.json` 就是完整账号备份
+- **导出**：复制这个 `accounts.json` 就是完整账号备份；面板「导出-导入账号」也能一键复制成账号包（见方式 C）
 - **导入**：把文件放到另一台设备的**数据目录**（默认 `~/.dsh/doubao-work/`）即完成迁移
 - 运行状态（冷却倒计时/用量统计）另存于同一数据目录的 `gateway-state.json`，不影响账号数据
 
-> 手机 DSH 小技巧：如果手机上不便直接编辑文件，可以直接对 DSH 说“把这段 Cookie 写进 `<dshHome>/doubao-work/accounts.json`，格式是……”让它代写；
-> 或者用设置页的粘贴框（1.2.6 起整段 Cookie / `Cookie:` 头 / Copy as cURL 都能直接贴）。
+**方式 C：账号包（1.4.0 起，换设备 / 传手机用这个）** —— 面板工具栏点「导出-导入账号」：
+
+1. 点「导出账号包」→ 文本框里出现一整段 JSON（含全部账号的 Cookie），复制走
+2. 在另一台设备（或手机）的面板里点「切到导入」，把这段 JSON 贴进去 → 「导入账号包」
+3. 按 `id` 合并：同 id 覆盖 Cookie（续期/换号），新 id 追加；接口层还支持 `mode:'replace'` 整份替换
+
+> 账号包 = `accounts.json` 的等价物，只走本机接口（同源 + 回环守卫），不经过任何服务器。
+> 单个账号也可以直接把一段 Cookie 贴进导入框，服务端会认出来并当成新账号加进去。
+>
+> 手机 DSH 的用法：在电脑导出 → 用网盘/聊天工具/剪贴板同步把这段 JSON 传到手机 →
+> 在手机 DSH 的同一页粘贴导入。这是目前手机上唯一能"整份迁移"的路子，原因见「待办 / 已知缺口」。
 
 ## 获取新账号的 Cookie
 
@@ -159,14 +172,23 @@ dsh-doubao-work/
 ├── client.js          # 浏览器半身：设置页「豆包工作」
 ├── package.json
 ├── cordis.patch.yml
-├── tests/             # smoke.mjs（契约/接口）、upstream.mjs（本地假上游）、profile-install.mjs（安装形态）
-├── tools/             # status / accounts / panel / git-api-push
-└── standalone/        # 同内核的 OpenAI 兼容网关（独立进程）
+├── tests/             # smoke.mjs（契约/接口）、upstream.mjs（本地假上游）、
+│                        standalone.mjs（真启动网关打假上游）、profile-install.mjs（安装形态）
+├── tools/             # status / accounts / panel / browser-import / model-probe / git-api-push
+├── docs/              # 上游接口实测记录（抓包结论、SSE 事件表、模型 key 对照）
+└── standalone/        # 复用 doubao.js 的 OpenAI 兼容网关（独立进程）
 ```
 
 ## 附：standalone 网关
 
-`standalone/` 目录是同内核的独立 OpenAI 兼容网关（`node index.js`，默认 `127.0.0.1:3040/v1`），适合不想装插件、或想给其他 OpenAI 客户端/中转站供流的场景。配置 `config.json` + `accounts.json`（填 Cookie）后启动。
+`standalone/` 目录是独立 OpenAI 兼容网关（`node standalone/index.js`，默认 `127.0.0.1:3040/v1`），
+适合不想装插件、或想给其他 OpenAI 客户端/中转站供流的场景。
+
+- **1.4.0 起复用 `doubao.js`**：账号池、RPM 限速、并发排队、冷却分级、SSE 解析、流中断保护、
+  `conversation_id` 复用全部与插件同一份代码，本文件只保留 OpenAI 协议适配 + HTTP 服务 + 状态页
+- 配置 `config.json`，账号放 `accounts.json`；`models` 决定白名单（未列出的模型返回 400，不偷换）
+- `config.contextReuse`（默认 `true`）复用上游会话；`DSH_DOUBAO_GATEWAY_DIR` 可换配置目录（多实例/测试用）
+- 自测：`node tests/standalone.mjs`（真启动网关，上游指向本地假豆包，9 项）
 
 ## 内嵌设置页
 
@@ -175,15 +197,19 @@ dsh-doubao-work/
 
 页面上还能「添加账号」（直接粘贴整段 Cookie，保存即生效）、「停用/启用」、「换 Cookie」与「删除」，
 1.3.0 起多了「从浏览器导入」：点开临时浏览器窗口 → 在里面登录豆包 → 点「抓取 Cookie（并入库）」。
+1.4.0 起工具栏还有「一键签到」（签整个账号池）、每行的「签到」（只签这一个号）、以及
+「导出-导入账号」（账号包，见上文方式 C）。
 停用的账号仍然显示在列表里（状态显示「已停用」），所以随时可以点回来启用。
 「添加账号 / 换 Cookie」的粘贴框会自动识别六种粘贴形状并回显识别结果（见上文「获取 Cookie」），
-空态文案与页脚会直接显示当前账号文件路径（数据目录可能被 `dataDir` 改过，写死路径会误导）。
+空态文案与页脚会直接显示当前账号文件路径（数据目录可能被 `dataDir` 改过，写死路径会误导）；
+页脚还会显示自动签到的下次执行时间（没配就提示 `checkinSchedule: "09:30"` 怎么写）。
 
 离线自检（不重启、不联网、不耗额度）：
 
 ```bash
-node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/浏览器导入(CDP)/签到/数据目录/错误码/复用规划/流协议，共 94 项
-node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到，共 17 项
+node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/浏览器导入(CDP)/模型 key 抓取/签到/账号包/数据目录/错误码/流协议，共 108 项
+node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到/key 验证，共 20 项
+node tests/standalone.mjs # 真启动 standalone 网关（临时目录 + 假上游）：OpenAI 形状/流式/白名单/会话复用，9 项
 ELECTRON_RUN_AS_NODE=1 DSH_HOST_MODULES="<安装目录>/app.asar/dsh/node_modules" \
   "<安装目录>/DeepSeek Harness.exe" tests/profile-install.mjs   # 模拟 profile 安装，6 项
 ```
@@ -216,6 +242,11 @@ node tools/accounts.mjs list                     # 列出账号
 node tools/accounts.mjs add --id acc-2 --remark 小号 --cookie-file /tmp/c.txt
 node tools/accounts.mjs disable --id acc-2
 node tools/accounts.mjs export --out /tmp/backup.json
+
+node tools/browser-import.mjs --browser edge     # 命令行版「从浏览器导入」（--attach 连已开的调试端口）
+node tools/model-probe.mjs --list                # 已配置模型 ↔ model_item_key 对照
+node tools/model-probe.mjs --capture             # 抓新模型的 model_item_key（只开 Network 观察，不改页面）
+node tools/model-probe.mjs --key <key>           # 验证某个 key 是否真生效（看 SSE_ACK 回写）
 ```
 
 ## 推送代码（国内网络备选）
@@ -235,7 +266,8 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
 
 - `GET  /doubao/status`（或 `/api/doubao/status`）— 账号池（含停用）+ 今日用量 + 会话数 +
   `runtime.host`（宿主包解析来源，排查「装上了但没生效」先看这里）+
-  `dataDir` / `accountsPath`（账号文件到底在哪，面板空态就用它）
+  `dataDir` / `accountsPath`（账号文件到底在哪，面板空态就用它）+
+  `checkinSchedule`（配置的每日签到时刻）/ `checkinNextAt`（下次执行时间戳，未开启为 0）
 - `POST /doubao/check` — 逐账号健康检查
 - `POST /doubao/account/add|update|enable|remove` — 账号增删改启停（`update` 用于换 Cookie，不用删了再加）。
   `add`/`update` 的 Cookie 字段接受任意常见粘贴形状，成功时返回 `parse`
@@ -248,6 +280,11 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
 - `POST /doubao/browser/grab` — 抓取并入库（`{port?, id?, remark?, save?}`，`save:false` 只回结果不写文件）；
   成功返回 `{ok:true, describe, doubaoCookies, httpOnly, keys, id}`，没登录返回 `{ok:false, stage:'login', reason}`
 - `POST /doubao/browser/close` — 结束拉起的浏览器进程并清理临时 profile
+- `POST /doubao/accounts/export` — 导出账号包：`{ok, count, accounts, json}`，`json` 就是能整体复制的那段
+- `POST /doubao/accounts/import` — 导入账号包或单条 Cookie：`{text, mode:'merge'|'replace'}` →
+  `{ok, mode, added, updated, skipped, total}`（按 `id` 合并，同 id 覆盖 Cookie，重复导入幂等）
+- `POST /doubao/models/probe` — 验证一个 `model_item_key` 是否真被服务端接受：`{key, id?}` →
+  `{ok, echoed, key, account}`，判据是 SSE_ACK 里服务端回写的 key（不是模型自称），会消耗一次极短对话
 
 **访问控制**：带 `Origin` 的浏览器请求必须同源；不带 `Origin` 的调用只放行本机（`127.0.0.1` / `::1`）。
 需要从别的机器调管理接口时，在配置里设 `adminToken`，并带上请求头：
@@ -308,17 +345,36 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 - **读浏览器 Cookie 库**（Chrome/Edge 的 sqlite + DPAPI/ABE）没有做，也不建议做：Chrome/Edge 127+ 的
   App-Bound Encryption 让第三方进程解不开，macOS/Linux 又各有 Keychain/Secret Service 门槛，
   国产内核路径不一。CDP 一条路把这些全绕开了，见上文「从浏览器导入是怎么做的」。
-- `standalone/` 独立网关是**同逻辑的另一份实现**，1.2.2 已同步流中断保护（截断时 `finish_reason: length`
-  并记 warn），但**仍不支持 function calling**，也没有接浏览器导入。后续应改为直接复用 `doubao.js`，避免两处漂移。
-- 8 个未抓 `model_item_key`（豆包 2.1 Pro / Kimi K3 / GLM 5.3 等），抓到即可加进 `extraModels`。
-- 签到接口 1.2.3 已抓到并接入（`/alice/ug/campaign/v3/detail/` 查状态 + `/alice/ug/campaign/landing/checkin` 执行，
-  详见 docs 与 `/doubao/checkin`）。待办：面板上的「一键签到」按钮接线，以及把每日签到做成定时任务。
+- 8 个未抓 `model_item_key`（豆包 2.1 Pro / Kimi K3.1 Pro / Kimi K3 / GLM 5.3 / GLM 5.3 Flash / DeepSeek V4 Pro 等）：
+  抓取与验证工具已就位（`tools/model-probe.mjs --capture` / `--key` + `/doubao/models/probe`），
+  但**真实 key 必须用登录态账号在网页里逐个点一遍才能拿到**，所以没在仓库里编造。抓到后加进 `extraModels` 即可。
+- `standalone/` 已在 1.4.0 **改成直接复用 `doubao.js`**（账号池/RPM/冷却/SSE/会话复用只有一份实现），
+  并补了 `tests/standalone.mjs`。仍**不支持 function calling**（上游没有这个能力），也没有接浏览器导入。
+- 签到：面板「一键签到」+ 每日定时（`checkinSchedule` + 启动后补签）都已接线完成，见「更新记录」1.4.0。
 - 扫码 / 短信登录仍不可行：登录页走 `accounts.doubao.com` 的 webmssdk 风控签名，纯后端模拟只会得到
   `非法应用(22)`；真扫码需要宿主开内嵌窗口（WebContents，登录后从那个 session 读 Cookie），
   DSH 插件 API 目前不暴露窗口能力——这条得向宿主提需求。
 
 ## 更新记录
 
+- **1.4.0**（2026-11-13，签到/账号包/模型 key/standalone 合并）：
+  - **每日自动签到**：面板加「一键签到」（整池）与每行「签到」（单号）；配置 `checkinSchedule: "09:30"`
+    后每天到点自动签，`checkinCatchUp: true`（默认）时启动后 15 秒发现"今天还没签"会自动补一次。
+    定时器按 provider 注册在 `globalThis.__dshDoubaoCheckinTimers`，重载插件时先清旧的，不会叠加。
+    状态接口新增 `checkinSchedule` / `checkinNextAt`，面板页脚显示下次执行时间。
+  - **账号包导出/导入**：`/doubao/accounts/export|import` + 面板「导出-导入账号」。导出是一段可整体复制的
+    JSON（`accounts.json` 等价物），导入支持 `merge`（按 id 合并，同 id 覆盖 Cookie、幂等）与 `replace`；
+    只贴一段 Cookie 也能当新账号导入。这是换设备/传手机时唯一能整份迁移的办法。
+  - **模型 key 抓取与验证**：`tools/model-probe.mjs`（`--capture` 监听页面 `chat/completion` 请求体抓
+    `model_item_key`、`--key` 验证、`--list` 对照）+ `POST /doubao/models/probe`。验证判据是
+    **SSE_ACK 里服务端回写的 `model_item_key`**（`DoubaoClient.probeModelKey`），回写不等于传入就是没生效，
+    不靠"模型自称是谁"猜。抓取只开 CDP `Network` 观察域，不注入脚本、不改页面，且必须用户手动触发。
+  - **standalone 合并**：`standalone/index.js` 从 585 行降到 ~320 行，删掉第二份账号池/RPM/冷却/SSE 实现，
+    改为 `new DoubaoClient(...)` + OpenAI 协议适配；顺带获得流中断保护、会话复用、统一冷却策略。
+    新增 `tests/standalone.mjs`（真启动子进程 + 本地假上游，9 项：健康检查/模型白名单/apiKey/非流式/
+    流式/未知模型 400/会话复用/状态页/健康检查接口）。
+  - **测试**：smoke 94 → 108 项（新增 model_item_key 抓取 3 项 + 签到/账号包/浏览器用例），
+    upstream 17 → 20 项（probeModelKey 三种结局）。
 - **1.3.0**（2026-11-13，加「从浏览器导入」）：
   - **新增 `browser.js`**：CDP（Chrome DevTools 协议）抓取豆包 Cookie。探测本机 Chromium 内核浏览器
     （Edge → Chrome → Chromium，含 Windows 上 `EdgeCore\<版本>\msedge.exe` 这种布局），用

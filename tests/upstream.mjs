@@ -21,6 +21,8 @@ const upstream = {
   defaultBehavior: 'ok',
   bodies: [],
   hits: [],
+  /** probeModelKey 用：非空时假装服务端把 key 换成了这个值 */
+  ackKeyOverride: '',
   // 活动/签到接口可控项
   campaign: { checkedIn: false, detailCode: 0, detailHttp: 200, checkinCode: 0 },
 };
@@ -96,7 +98,18 @@ const server = http.createServer((req, res) => {
 
     res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' });
     sse(res, 'SSE_HEARTBEAT', {});
-    sse(res, 'SSE_ACK', { ack_client_meta: { conversation_info: { conversation_id: 'conv-test-1' } } });
+    // 真实豆包在 SSE_ACK 里回写实际生效的 model_item_key，probeModelKey 靠它判定成败，
+    // 所以假上游也要回写（ackKeyOverride 可模拟「传 A 实际生效 B」）
+    let echoKey = '';
+    try { echoKey = JSON.parse(raw)?.option?.conversation_init_ext?.model_item_key || ''; } catch (e) { /* ignore */ }
+    sse(res, 'SSE_ACK', {
+      ack_client_meta: {
+        conversation_info: {
+          conversation_id: 'conv-test-1',
+          extra: { model_item_key: upstream.ackKeyOverride || echoKey },
+        },
+      },
+    });
 
     if (mode === 'empty') { sse(res, 'SSE_REPLY_END', {}); res.end(); return; }
 
@@ -320,6 +333,34 @@ await ok('多账号汇总：单号失败不影响其他号', async () => {
   c.checkin = async (a) => (a.id === 'a1' ? Promise.reject(new DoubaoError('network', '模拟网络故障')) : spy(a));
   const results = await c.checkinAll();
   assert.deepEqual(results.map(r => r.result).sort(), ['error', 'ok']);
+});
+
+// ---------------- 1.4.0：model_item_key 验证（以服务端回写为准） ----------------
+await ok('probeModelKey：回写等于传入才算生效', async () => {
+  upstream.ackKeyOverride = '';
+  upstream.defaultBehavior = 'ok';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.probeModelKey(acc('a1', COOKIE_A), 'seed-lite-7b');
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.echoed, 'seed-lite-7b');
+});
+
+await ok('probeModelKey：平台把 key 换成别的时如实报未生效', async () => {
+  upstream.ackKeyOverride = 'auto-assigned-other';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.probeModelKey(acc('a1', COOKIE_A), 'person-deepseek-v4-1-flash-261017');
+  assert.equal(r.ok, false);
+  assert.equal(r.echoed, 'auto-assigned-other');
+  upstream.ackKeyOverride = '';
+});
+
+await ok('probeModelKey：上游报错不炸，返回 ok:false 带原因', async () => {
+  upstream.defaultBehavior = '429';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const r = await c.probeModelKey(acc('a1', COOKIE_A), 'seed-lite-7b');
+  assert.equal(r.ok, false);
+  assert.match(r.error || '', /限流|429|风控/);
+  upstream.defaultBehavior = 'ok';
 });
 
 server.close();

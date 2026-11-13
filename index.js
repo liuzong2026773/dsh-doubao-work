@@ -64,6 +64,8 @@ export const Config = Schema && Schema.object({
   adminToken: Schema.string().description('跨机管理令牌：仅在非本机访问管理接口时需要，留空则只允许本机调用').default(''),
   dataDir: Schema.string().description('Cookie 与用量状态的存放目录（留空用 <dshHome>/doubao-work；不要放插件目录，升级会被覆盖）').default(''),
   browserPath: Schema.string().description('「从浏览器导入」用的浏览器可执行文件路径（留空自动探测 Edge/Chrome/Chromium）').default(''),
+  checkinSchedule: Schema.string().description('每日自动签到的本地时刻，形如 "09:30"；留空表示不自动签到').default(''),
+  checkinCatchUp: Schema.boolean().description('DSH 启动时若已过签到时刻且今天还没签到，补跑一次').default(true),
   upstream: Schema.object({
     aid: Schema.string().description('应用 ID').default('497858'),
     device_id: Schema.string().description('设备 ID').default('7707509248230065699'),
@@ -79,7 +81,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.3.0';
+export const VERSION = '1.4.0';
 
 /**
  * 配置默认值。
@@ -109,6 +111,8 @@ export const DEFAULTS = {
   adminToken: '',
   dataDir: '',
   browserPath: '',
+  checkinSchedule: '',
+  checkinCatchUp: true,
   upstream: {
     aid: '497858',
     device_id: '7707509248230065699',
@@ -130,6 +134,38 @@ export function withDefaults(config) {
   return cfg;
 }
 
+// ---------------- 每日签到定时器 ----------------
+
+/** 解析 "HH:MM"；不合法返回 null（不合法就不该起定时器） */
+export function parseClock(text) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(text || '').trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (h > 23 || min > 59) return null;
+  return { h, m: min };
+}
+
+/** 距离下一个 "HH:MM" 还有多少毫秒（今天的已过就算明天） */
+export function msUntilNextClock(text, now = Date.now()) {
+  const c = parseClock(text);
+  if (!c) return null;
+  const d = new Date(now);
+  d.setHours(c.h, c.m, 0, 0);
+  let delta = d.getTime() - now;
+  if (delta <= 0) delta += 24 * 3600 * 1000;
+  return delta;
+}
+
+/** 今天的 "HH:MM" 是否已经过去（冷启动补跑判定用） */
+export function clockPassedToday(text, now = Date.now()) {
+  const c = parseClock(text);
+  if (!c) return false;
+  const d = new Date(now);
+  d.setHours(c.h, c.m, 0, 0);
+  return now >= d.getTime();
+}
+
 // ---------------- OpenAI Message → 豆包文本 ----------------
 
 function blockText(blocks) {
@@ -141,7 +177,7 @@ function blockText(blocks) {
  * 粗略 token 估算（只用于 usage 上报，不参与计费）。
  * 中文/全角约 1 字 1 token，ASCII 约 4 字符 1 token——比一律 length/4 更接近真实。
  */
-function estimateTokens(text) {
+export function estimateTokens(text) {
   const s = String(text || '');
   if (!s) return 0;
   let wide = 0;
@@ -163,7 +199,7 @@ export const ERROR_CODES = {
 };
 
 /** DSH Message[] + system → 豆包单段文本（每次新建会话，需自带完整上下文） */
-function messagesToText(options) {
+export function messagesToText(options) {
   const msgs = options.messages || [];
   const roleOf = (m) => {
     if (m.role === 'assistant') return 'AI';
@@ -357,6 +393,55 @@ export function apply(ctx, rawConfig) {
 
   ctx.llm.registerAdapter([config.providerId], new DoubaoLlmAdapter({ client, config, log }));
 
+  // ---------------- 每日自动签到 ----------------
+  /** 排定状态，给 /doubao/status 与面板显示「下次几点签」用 */
+  const checkinState = { schedule: '', nextAt: 0 };
+  // 配置 checkinSchedule: "09:30" 后：到点全账号签到；DSH 重启时若已过点且今天还有账号没签，补跑一次
+  //（checkinCatchUp）。结果写进账号状态（checkinToday 字段），面板与 /doubao/checkin/status 都可见。
+  const runScheduledCheckin = async (why) => {
+    try {
+      const results = await client.checkinAll();
+      const okN = results.filter(r => r.result === 'ok').length;
+      const alreadyN = results.filter(r => r.result === 'already').length;
+      const failN = results.filter(r => r.result === 'failed' || r.result === 'error').length;
+      log('info', `定时签到（${why}）：成功 ${okN}｜已签过 ${alreadyN}｜失败 ${failN}`);
+    } catch (e) { log('warn', `定时签到（${why}）失败：${e.message}`); }
+  };
+  // 热重载时同一个 provider 只保留一个定时器，否则每次 apply 都会多排一份
+  if (!globalThis.__dshDoubaoCheckinTimers) globalThis.__dshDoubaoCheckinTimers = {};
+  const timerKey = String(config.providerId);
+  if (globalThis.__dshDoubaoCheckinTimers[timerKey]) clearTimeout(globalThis.__dshDoubaoCheckinTimers[timerKey]);
+  checkinState.schedule = String(config.checkinSchedule || '');
+  checkinState.nextAt = 0;
+  if (parseClock(config.checkinSchedule)) {
+    const arm = () => {
+      const delta = msUntilNextClock(config.checkinSchedule);
+      if (delta === null) return;
+      checkinState.nextAt = Date.now() + delta;
+      const t = setTimeout(async () => {
+        delete globalThis.__dshDoubaoCheckinTimers[timerKey];
+        await runScheduledCheckin('到点');
+        arm();
+      }, delta);
+      if (typeof t.unref === 'function') t.unref(); // 不该让插件的定时器拖着宿主不退出
+      globalThis.__dshDoubaoCheckinTimers[timerKey] = t;
+    };
+    arm();
+    if (config.checkinCatchUp !== false && clockPassedToday(config.checkinSchedule)) {
+      const enabled = client.snapshot().filter(a => a.enabled !== false);
+      const done = enabled.filter(a => a.checkinToday === 'ok' || a.checkinToday === 'already');
+      if (enabled.length && done.length < enabled.length) {
+        log('info', `已过签到时刻 ${config.checkinSchedule}，还有 ${enabled.length - done.length} 个账号没签，15 秒后补跑`);
+        const t = setTimeout(() => runScheduledCheckin('补跑'), 15000);
+        if (typeof t.unref === 'function') t.unref();
+      } else if (!enabled.length) {
+        log('info', `每日签到已排定 ${config.checkinSchedule}（当前没有启用账号，等账号就绪后自动执行）`);
+      }
+    }
+    log('info', `每日自动签到：${config.checkinSchedule}（下次 ${new Date(checkinState.nextAt).toLocaleString('zh-CN')}）`);
+  }
+
+
   // ---------------- 状态接口（本机只读） ----------------
   // GET  /doubao/status  → 账号池 + 今日用量 + 会话数
   // POST /doubao/check   → 逐个账号做健康检查
@@ -399,6 +484,9 @@ export function apply(ctx, rawConfig) {
             },
             conversations: client.convMap.size,
             contextReuse: config.contextReuse !== false,
+            // 每日签到排定状态（checkinSchedule 为空表示未启用自动签到）
+            checkinSchedule: checkinState.schedule,
+            checkinNextAt: checkinState.nextAt,
             // 账号文件到底在哪：面板空态文案与排障都要用它（1.2.5 起不再在插件目录）
             dataDir: files.dir,
             accountsPath: files.accountsPath,
@@ -689,6 +777,101 @@ export function apply(ctx, rawConfig) {
             const r = await closeBrowser(browserHandle || {});
             browserHandle = null;
             json(res, 200, r);
+          } catch (e) {
+            json(res, 500, { ok: false, error: String(e.message || e) });
+          }
+        },
+      });
+
+      // ---------------- 账号包导出 / 导入（手机同步、备份、多机迁移） ----------------
+      /** 只收「有 Cookie 且 Cookie 能规范化」的账号；Cookie 字段本身也走粘贴解析器，容错 */
+      const normalizeImported = (raw) => {
+        const list = Array.isArray(raw) ? raw : (raw && Array.isArray(raw.accounts) ? raw.accounts : null);
+        if (!list) return null;
+        const out = [];
+        for (const a of list) {
+          if (!a || typeof a.cookie !== 'string' || !a.cookie.trim()) continue;
+          const parsed = parseCookieInput(a.cookie);
+          const cookie = parsed.pairs ? parsed.cookie : a.cookie.trim();
+          if (cookie.length < 20) continue;
+          out.push({
+            id: typeof a.id === 'string' ? a.id : '',
+            remark: typeof a.remark === 'string' ? a.remark : '',
+            cookie,
+            enabled: a.enabled !== false,
+          });
+        }
+        return out;
+      };
+
+      register({
+        kind: 'exact',
+        path: '/doubao/accounts/export',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const list = readAccountsFile().map(a => ({ id: a.id, remark: a.remark || '', cookie: a.cookie, enabled: a.enabled !== false }));
+          // json 字段就是可直接落盘的账号包文本：手机端/另一台机器拿它去 `import` 即可
+          json(res, 200, { ok: true, count: list.length, accounts: list, json: JSON.stringify({ accounts: list }, null, 2) });
+        },
+      });
+
+      register({
+        kind: 'exact',
+        path: '/doubao/accounts/import',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = await parseBody(req);
+          const text = typeof body?.text === 'string' ? body.text.trim() : '';
+          if (!text) return json(res, 400, { ok: false, error: '需要 text：导出的账号包 JSON，或一段 Cookie / `Cookie:` 头 / cURL / 扩展导出的 JSON' });
+          // 先按账号包解析；不是 JSON 就退回「单个 Cookie」粘贴解析，两种形态共用一条入口
+          let incoming = null;
+          try { incoming = normalizeImported(JSON.parse(text)); } catch { /* 不是 JSON */ }
+          if (incoming === null) {
+            const p = parseCookieInput(text);
+            if (!p.pairs || p.cookie.length < 20) {
+              return json(res, 400, { ok: false, error: '既不是账号包 JSON，也没识别出 Cookie：' + (p.warnings || []).join('；') });
+            }
+            incoming = [{ id: '', remark: '', cookie: p.cookie, enabled: true }];
+          }
+          if (!incoming.length) return json(res, 400, { ok: false, error: '账号包里没有可用账号（Cookie 为空或太短）' });
+          const mode = body?.mode === 'replace' ? 'replace' : 'merge';
+          const current = mode === 'replace' ? [] : readAccountsFile();
+          let added = 0, updated = 0, skipped = 0;
+          for (const a of incoming) {
+            const id = a.id && ID_RE.test(a.id) ? a.id : '';
+            const i = current.findIndex(x => (id ? x.id === id : x.cookie === a.cookie));
+            if (i >= 0) {
+              current[i] = { ...current[i], cookie: a.cookie, enabled: a.enabled, ...(a.remark ? { remark: a.remark } : {}) };
+              updated++;
+            } else if (!id && current.some(x => x.cookie === a.cookie)) {
+              skipped++;
+            } else {
+              let newId = id;
+              if (!newId) { let n = current.length + 1; while (current.some(x => x.id === `acc-${n}`)) n++; newId = `acc-${n}`; }
+              current.push({ id: newId, remark: a.remark || '', cookie: a.cookie, enabled: a.enabled });
+              added++;
+            }
+          }
+          writeAccountsFile(current);
+          json(res, 200, { ok: true, mode, added, updated, skipped, total: current.length });
+        },
+      });
+
+      register({
+        kind: 'exact',
+        path: '/doubao/models/probe',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = await parseBody(req);
+          const key = typeof body?.key === 'string' ? body.key.trim() : '';
+          if (!key) return json(res, 400, { ok: false, error: '需要 key：要验证的 model_item_key' });
+          const id = typeof body?.id === 'string' ? body.id : '';
+          const list = client.allAccounts().filter(a => a.enabled !== false);
+          const account = id ? list.find(a => a.id === id) : list[0];
+          if (!account) return json(res, 400, { ok: false, error: '没有可用账号（先导入一个 Cookie）' });
+          try {
+            const r = await client.probeModelKey(account, key);
+            json(res, 200, { ...r, account: account.id, key });
           } catch (e) {
             json(res, 500, { ok: false, error: String(e.message || e) });
           }

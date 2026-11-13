@@ -27,6 +27,9 @@ window.__ModuleLoader__.load({
     const api = {
       status: () => req('/api/doubao/status', { cache: 'no-store' }),
       check: () => req('/api/doubao/check', { method: 'POST' }),
+      checkin: (body) => req('/api/doubao/checkin', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body || {}),
+      }),
       enable: (id, enabled) => req('/api/doubao/account/enable', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, enabled }),
       }),
@@ -46,6 +49,12 @@ window.__ModuleLoader__.load({
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opt || {}),
       }),
       browserClose: (opt) => req('/api/doubao/browser/close', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opt || {}),
+      }),
+      exportAccounts: () => req('/api/doubao/accounts/export', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      }),
+      importAccounts: (opt) => req('/api/doubao/accounts/import', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opt || {}),
       }),
     }
@@ -88,6 +97,8 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('')
       const [log, setLog] = useState('')
       const [browser, setBrowser] = useState(null) // 从浏览器导入：{port, browser:{name}, hint}
+      const [syncMode, setSyncMode] = useState(null) // 'export' | 'import' | null
+      const [syncText, setSyncText] = useState('')
 
       const load = useCallback(async () => {
         try {
@@ -102,6 +113,20 @@ window.__ModuleLoader__.load({
         setBusy('check'); setLog('检查中…')
         try { setLog(JSON.stringify((await api.check()).results, null, 2)) }
         catch (e) { setLog('失败: ' + (e.message || e)) }
+        setBusy(''); load()
+      }
+      // 一键签到：不带 id = 全部账号；带 id = 单号。服务端按天幂等，重复点不会重复领
+      const onCheckin = async (id) => {
+        setBusy(id ? 'checkin-' + id : 'checkin')
+        setLog(id ? '正在给 ' + id + ' 签到…' : '正在给全部账号签到…')
+        try {
+          const list = (await api.checkin(id ? { id } : {})).results || []
+          const okN = list.filter(x => x.result === 'ok').length
+          const alreadyN = list.filter(x => x.result === 'already').length
+          const bad = list.filter(x => x.result === 'failed' || x.result === 'error')
+          setLog('签到完成：新签 ' + okN + '｜今天已签过 ' + alreadyN + '｜失败 ' + bad.length
+            + (bad.length ? '\n' + bad.map(x => '- ' + x.id + '：' + (x.error || '失败')).join('\n') : ''))
+        } catch (e) { setLog('签到失败：' + (e.message || e)) }
         setBusy(''); load()
       }
       const onToggle = async a => { setBusy(a.id); try { await api.enable(a.id, !a.enabled) } catch (e) {} setBusy(''); load() }
@@ -159,6 +184,29 @@ window.__ModuleLoader__.load({
         setBrowser(null); setLog('已关闭导入用的浏览器窗口（临时配置已清理）')
       }
 
+      // ---- 账号包导出 / 导入：手机同步、备份、多机迁移 ----
+      const onExport = async () => {
+        setBusy('export')
+        try {
+          const r = await api.exportAccounts()
+          if (!r.count) { setLog('没有账号可导出'); setBusy(''); return }
+          setSyncMode('export'); setSyncText(r.json)
+          setLog('已生成账号包（' + r.count + ' 个账号，含 Cookie）。复制下面的文本，粘到另一台 DSH / 手机的「导入账号包」即可')
+        } catch (e) { setLog('导出失败：' + (e.message || e)) }
+        setBusy('')
+      }
+      const onImport = async () => {
+        const text = String(syncText || '').trim()
+        if (!text) { setLog('先把账号包（或一段 Cookie）粘进上面的框'); return }
+        setBusy('import')
+        try {
+          const r = await api.importAccounts({ text })
+          setLog('导入完成：新增 ' + r.added + '、更新 ' + r.updated + '、跳过 ' + r.skipped + '，当前共 ' + r.total + ' 个账号')
+          setSyncMode(null); setSyncText('')
+        } catch (e) { setLog('导入失败：' + (e.message || e)) }
+        setBusy(''); load()
+      }
+
       if (err) return h('div', { style: S.wrap }, h('div', { style: { color: '#c0392b' } }, '读取失败：' + err),
         h('div', { style: S.mute }, '请确认插件已重启（状态接口 /doubao/status 由宿主进程提供）。'))
 
@@ -181,8 +229,10 @@ window.__ModuleLoader__.load({
         h('div', { style: S.row },
           h('button', { style: S.btn, onClick: load, disabled: !!busy }, '刷新'),
           h('button', { style: S.btn, onClick: onCheck, disabled: !!busy }, busy === 'check' ? '检查中…' : '全部健康检查'),
+          h('button', { style: S.btn, onClick: () => onCheckin(), disabled: !!busy }, busy === 'checkin' ? '签到中…' : '一键签到'),
           h('button', { style: S.btn, onClick: () => (showAdd ? setShowAdd(false) : openAdd()) }, showAdd ? '收起' : '添加账号'),
-          h('button', { style: S.btn, onClick: onBrowserLaunch, disabled: !!busy }, busy === 'browser' ? '打开中…' : '从浏览器导入')),
+          h('button', { style: S.btn, onClick: onBrowserLaunch, disabled: !!busy }, busy === 'browser' ? '打开中…' : '从浏览器导入'),
+          h('button', { style: S.btn, onClick: () => (syncMode ? (setSyncMode(null), setSyncText('')) : onExport()), disabled: !!busy }, syncMode ? '收起账号包' : '导出/导入账号')),
 
         browser ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderRadius: 10, border: '1px solid var(--dsw-alias-border-l2, #e3e6ea)' } },
           h('div', { style: S.mute },
@@ -211,6 +261,23 @@ window.__ModuleLoader__.load({
             h('button', { style: S.btn, disabled: !!busy, onClick: onSave }, formMode === 'update' ? '更新 Cookie' : '保存'),
             h('button', { style: S.btn, onClick: () => setShowAdd(false) }, '取消'))) : null,
 
+        syncMode ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderRadius: 10, border: '1px solid var(--dsw-alias-border-l2, #e3e6ea)' } },
+          h('div', { style: S.mute }, syncMode === 'export'
+            ? '账号包含 Cookie（等同于密码），别贴到公开地方。复制下面整段，到另一台 DSH / 手机的「导出/导入账号」里切到导入、粘贴即可。'
+            : '把账号包 JSON 粘到下面（也接受一段 Cookie / `Cookie:` 头 / cURL / 扩展导出的 JSON）。默认按 id 合并，不会删掉本机已有账号。'),
+          h('textarea', {
+            rows: 6, value: syncText, readOnly: syncMode === 'export',
+            placeholder: syncMode === 'import' ? '{"accounts":[{"id":"acc-1","cookie":"…"}]}  或直接粘一段 Cookie' : '',
+            style: { width: '100%', padding: 8, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit', fontFamily: 'monospace', fontSize: 12 },
+            onChange: e => setSyncText(e.target.value),
+            onFocus: e => { if (syncMode === 'export') e.target.select() },
+          }),
+          h('div', { style: S.row },
+            syncMode === 'export'
+              ? h('button', { style: S.btn, onClick: () => { setSyncMode('import'); setSyncText('') } }, '切到导入')
+              : h('button', { style: S.btn, onClick: onImport, disabled: !!busy }, busy === 'import' ? '导入中…' : '导入账号包'),
+            h('button', { style: S.btn, onClick: () => { setSyncMode(null); setSyncText('') } }, '关闭'))) : null,
+
         h('table', { style: S.table },
           h('thead', null, h('tr', null,
             ['账号', '状态', '今日请求', '预估剩余', '累计字数', '最近错误', '操作']
@@ -222,7 +289,8 @@ window.__ModuleLoader__.load({
               + (data.accountsPath ? ' 也可直接编辑账号文件 ' + data.accountsPath + '（改完保存即生效，不用重启）。' : ''))))
             : accounts.map(a => h('tr', { key: a.id },
               h('td', { style: S.td }, a.remark || a.id),
-              h('td', { style: { ...S.td, color: statusColor(a.status) } }, String(a.status)),
+              h('td', { style: { ...S.td, color: statusColor(a.status) } }, String(a.status),
+                a.checkinToday ? h('span', { style: { ...S.mute, color: a.checkinToday === 'failed' ? '#c0392b' : 'inherit' } }, a.checkinToday === 'failed' ? '｜签到失败' : '｜今日已签') : null),
               h('td', { style: S.td }, String(a.todayReq ?? 0)),
               h('td', { style: S.td }, String(a.quotaLeftEst ?? 0)),
               h('td', { style: S.td }, String(a.totalChars ?? 0)),
@@ -232,9 +300,13 @@ window.__ModuleLoader__.load({
                 h('span', { style: { display: 'inline-block', width: 6 } }),
                 h('button', { style: S.btn, disabled: !!busy, onClick: () => openUpdate(a) }, '换 Cookie'),
                 h('span', { style: { display: 'inline-block', width: 6 } }),
-                h('button', { style: S.btn, disabled: !!busy, onClick: () => onRemove(a) }, '删除')))))),
+                h('button', { style: S.btn, disabled: !!busy, onClick: () => onRemove(a) }, '删除'),
+                h('button', { style: { ...S.btn, marginLeft: 6 }, disabled: !!busy, onClick: () => onCheckin(a.id) }, busy === 'checkin-' + a.id ? '签到中…' : '签到')))))),
 
         h('div', { style: S.mute }, '「预估剩余」按 200 次/天（周一翻倍）自记账推算，平台不提供余量接口。'
+          + (data.checkinSchedule
+            ? '｜自动签到：每天 ' + data.checkinSchedule + (data.checkinNextAt ? '（下次 ' + new Date(data.checkinNextAt).toLocaleString('zh-CN') + '）' : '')
+            : '｜自动签到未开启（配置 checkinSchedule: "09:30" 即可）')
           + (data.accountsPath ? '｜账号文件：' + data.accountsPath : '')),
         log ? h('pre', { style: S.pre }, log) : null)
     }

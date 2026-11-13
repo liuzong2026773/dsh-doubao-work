@@ -43,13 +43,15 @@ const ctx = {
 console.log('加载与注册');
 ok('apply 不抛异常', () => mod.apply(ctx, { providerId: 'doubao-work', providerName: '测试', accounts: [], dataDir: DATA_DIR }));
 ok('注册了 provider', () => assert.deepEqual(adapterProviders, ['doubao-work']));
-ok('注册了预期路由集合（12 精确 + 1 /api 前缀）', () => {
+ok('注册了预期路由集合（16 精确 + 1 /api 前缀）', () => {
   assert.deepEqual(Object.keys(routes).sort(), [
     '/api/doubao',
     '/doubao/account/add',
     '/doubao/account/enable',
     '/doubao/account/remove',
     '/doubao/account/update',
+    '/doubao/accounts/export',
+    '/doubao/accounts/import',
     '/doubao/browser/browsers',
     '/doubao/browser/close',
     '/doubao/browser/grab',
@@ -57,6 +59,7 @@ ok('注册了预期路由集合（12 精确 + 1 /api 前缀）', () => {
     '/doubao/check',
     '/doubao/checkin',
     '/doubao/checkin/status',
+    '/doubao/models/probe',
     '/doubao/status',
   ].sort());
 });
@@ -561,6 +564,104 @@ ok('status 暴露数据目录与账号文件路径（面板空态要用）', () 
   assert.ok(String(stPath.accountsPath).endsWith('accounts.json'), stPath.accountsPath);
 });
 
+// ---------------- 1.4.0：每日自动签到（时刻计算） ----------------
+console.log('每日自动签到');
+ok('parseClock 只认 HH:MM', () => {
+  assert.deepEqual(mod.parseClock('09:30'), { h: 9, m: 30 });
+  assert.deepEqual(mod.parseClock(' 23:05 '), { h: 23, m: 5 });
+  assert.equal(mod.parseClock('24:00'), null, '小时超界');
+  assert.equal(mod.parseClock('9:70'), null, '分钟超界');
+  assert.equal(mod.parseClock('9点'), null);
+  assert.equal(mod.parseClock(''), null);
+});
+
+ok('msUntilNextClock：当天未到算今天，已过算明天', () => {
+  const at = (h, m) => { const d = new Date(2026, 10, 13, h, m, 0, 0); return d.getTime(); };
+  assert.equal(mod.msUntilNextClock('09:30', at(9, 0)), 30 * 60 * 1000);
+  assert.equal(mod.msUntilNextClock('09:30', at(10, 0)), 23.5 * 3600 * 1000);
+  assert.equal(mod.msUntilNextClock('09:30', at(9, 30)), 24 * 3600 * 1000, '正好到点算明天，避免刚跑完又跑');
+  assert.equal(mod.msUntilNextClock('乱写'), null);
+});
+
+ok('clockPassedToday：冷启动补跑判定', () => {
+  const at = (h, m) => new Date(2026, 10, 13, h, m, 0, 0).getTime();
+  assert.equal(mod.clockPassedToday('09:30', at(9, 29)), false);
+  assert.equal(mod.clockPassedToday('09:30', at(9, 30)), true);
+  assert.equal(mod.clockPassedToday('09:30', at(23, 59)), true);
+  assert.equal(mod.clockPassedToday('', at(12, 0)), false);
+});
+
+const stBody = JSON.parse((await call('/doubao/status', {})).body);
+ok('status 暴露签到排定状态（未配置时为空）', () => {
+  assert.equal(stBody.checkinSchedule, '', '测试配置没开自动签到');
+  assert.equal(stBody.checkinNextAt, 0);
+});
+
+// ---------------- 1.4.0：账号包导出 / 导入（手机同步） ----------------
+console.log('账号包导出 / 导入');
+await call('/doubao/account/add', { id: 'acc-pack', remark: '账号包用', cookie: COOKIE });
+const exp = await call('/doubao/accounts/export', {});
+const expJson = JSON.parse(exp.body);
+ok('export 给出计数与可直接落包的账号包文本', () => {
+  assert.equal(exp.code, 200);
+  assert.ok(expJson.count >= 1);
+  const parsed = JSON.parse(expJson.json);
+  assert.ok(Array.isArray(parsed.accounts), 'json 字段要能直接写进 accounts.json');
+  const a = parsed.accounts.find(x => x.id === 'acc-pack');
+  assert.ok(a && /sessionid=/.test(a.cookie));
+  assert.equal(a.remark, '账号包用');
+});
+
+await call('/doubao/account/remove', { id: 'acc-pack' });
+const PACK = JSON.stringify({ accounts: [{ id: 'acc-pack', remark: '账号包用', cookie: COOKIE, enabled: true }] });
+const imp = await call('/doubao/accounts/import', { text: PACK });
+ok('import 账号包：按 id 合并回来', () => {
+  const b = JSON.parse(imp.body);
+  assert.equal(imp.code, 200);
+  assert.equal(b.added, 1, imp.body);
+  assert.equal(b.updated, 0, imp.body);
+  const stored = JSON.parse(fs.readFileSync(ACCOUNTS_JSON, 'utf8')).accounts;
+  assert.ok(stored.some(a => a.id === 'acc-pack' && /sessionid=test/.test(a.cookie)));
+});
+
+const impAgain = await call('/doubao/accounts/import', { text: PACK });
+ok('重复导入幂等（更新，不重复建号）', () => {
+  const b = JSON.parse(impAgain.body);
+  assert.equal(b.added, 0, impAgain.body);
+  assert.equal(b.updated, 1, impAgain.body);
+  const stored = JSON.parse(fs.readFileSync(ACCOUNTS_JSON, 'utf8')).accounts;
+  assert.equal(stored.filter(a => a.id === 'acc-pack').length, 1);
+});
+
+const impPaste = await call('/doubao/accounts/import', { text: 'Cookie: sessionid=ccccddddeeee1234; sid_guard=z' });
+ok('也接受直接粘一段 Cookie（自动分配 id）', () => {
+  const b = JSON.parse(impPaste.body);
+  assert.equal(b.added, 1);
+  const stored = JSON.parse(fs.readFileSync(ACCOUNTS_JSON, 'utf8')).accounts;
+  const nu = stored.find(a => /sessionid=ccccddddeeee1234/.test(a.cookie));
+  assert.ok(nu && nu.id, '应自动分配 id');
+});
+
+const impJunk = await call('/doubao/accounts/import', { text: '这是一段中文说明，没有 Cookie' });
+ok('垃圾文本返回 400 并说明原因', () => {
+  assert.equal(impJunk.code, 400);
+  assert.match(JSON.parse(impJunk.body).error, /账号包|Cookie/);
+});
+
+const impEmpty = await call('/doubao/accounts/import', { text: '' });
+ok('空 text 返回 400', () => assert.equal(impEmpty.code, 400));
+
+const impReplace = await call('/doubao/accounts/import', { text: PACK, mode: 'replace' });
+ok('mode=replace 整表替换（迁移时清掉旧账号）', () => {
+  const b = JSON.parse(impReplace.body);
+  assert.equal(b.mode, 'replace');
+  assert.equal(b.total, 1, impReplace.body);
+  const stored = JSON.parse(fs.readFileSync(ACCOUNTS_JSON, 'utf8')).accounts;
+  assert.equal(stored.some(a => /sessionid=ccccddddeeee1234/.test(a.cookie)), false, 'replace 后本机粘的账号应被清掉');
+});
+
+await call('/doubao/account/remove', { id: 'acc-pack' });
+
 // ---------------- 1.3.0：从浏览器导入（CDP） ----------------
 console.log('从浏览器导入（CDP）');
 const browserMod = await import('../browser.js');
@@ -573,6 +674,11 @@ const cdp = http.createServer((req, res) => {
   if (req.url.startsWith('/json/version')) {
     res.writeHead(200, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ Browser: 'FakeEdge/999', webSocketDebuggerUrl: `ws://127.0.0.1:${cdp.address().port}/devtools/browser/fake` }));
+    return;
+  }
+  if (req.url.startsWith('/json/list')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify([{ type: 'page', url: 'https://www.doubao.com/chat/', webSocketDebuggerUrl: `ws://127.0.0.1:${cdp.address().port}/devtools/page/fake` }]));
     return;
   }
   res.writeHead(404); res.end('{}');
@@ -707,6 +813,69 @@ ok('launch 前清掉 6 小时前的残留临时 profile（不动新开的）', (
   assert.equal(fs.existsSync(freshDir), true, '新目录不能动');
 });
 fs.rmSync(freshDir, { recursive: true, force: true });
+
+// ---------------- 1.4.0：model_item_key 抓取（补齐模型用） ----------------
+console.log('model_item_key 抓取');
+ok('extractModelItemKey 从两种位置取值，格式不对返回 null', () => {
+  const a = JSON.stringify({ option: { conversation_init_ext: { model_item_key: 'k-from-init' } } });
+  const b = JSON.stringify({ option: { model_config: { model_item_key: 'k-from-config' } } });
+  assert.equal(browserMod.extractModelItemKey(a), 'k-from-init');
+  assert.equal(browserMod.extractModelItemKey(b), 'k-from-config');
+  assert.equal(browserMod.extractModelItemKey('{"option":{}}'), null);
+  assert.equal(browserMod.extractModelItemKey('不是 JSON'), null);
+  assert.equal(browserMod.extractModelItemKey(''), null);
+});
+
+const captureSeen = [];
+const captureSent = [];
+let captureResult = null;
+{
+  const recv = [];
+  const emit = (obj) => { for (const f of recv) f({ data: JSON.stringify(obj) }); };
+  const reqOf = (key) => ({
+    method: 'Network.requestWillBeSent',
+    params: { request: { url: 'https://www.doubao.com/chat/completion?aid=497858', postData: JSON.stringify({ option: { model_config: { model_item_key: key } } }) } },
+  });
+  const netSocket = {
+    addEventListener: (type, fn) => {
+      if (type === 'message') recv.push(fn);
+      if (type === 'open') queueMicrotask(() => fn()); // 连上就派发 open，和真 WebSocket 一致
+    },
+    send: (raw) => { const msg = JSON.parse(raw); captureSent.push(msg.method); if (msg.method === 'Network.enable') queueMicrotask(() => emit({ id: msg.id, result: {} })); },
+    close: () => {},
+  };
+  captureResult = await browserMod.captureModelKeys(
+    {
+      port: cdpPort,
+      timeoutMs: 3000,
+      stopAfter: 2,
+      onOpen: () => {
+        emit(reqOf('K1'));
+        emit({ method: 'Network.requestWillBeSent', params: { request: { url: 'https://www.doubao.com/other', postData: '{}' } } });
+        emit({ method: 'Network.requestWillBeSent', params: { request: { url: 'https://www.doubao.com/chat/completion', postData: '坏 JSON' } } });
+        emit(reqOf('K2'));
+        emit(reqOf('K3')); // stopAfter=2 之后不该再收
+      },
+      onKey: (item) => captureSeen.push(item.key),
+    },
+    { createSocket: () => netSocket },
+  );
+}
+ok('captureModelKeys 只认 chat/completion 里的 model_item_key，够了就停', () => {
+  assert.ok(captureResult, '应当返回结果');
+  assert.deepEqual(captureSeen, ['K1', 'K2'], '非 completion 路径与坏 JSON 不该进来，stopAfter 后不该继续');
+  assert.deepEqual([...new Set(captureSent)], ['Network.enable'], '只开网络观察域，不发别的指令');
+});
+
+ok('groupCookiesByDomain 区分豆包域与其他域（排障用）', () => {
+  const r = browserMod.groupCookiesByDomain([
+    { name: 'sessionid', value: 'x', domain: '.doubao.com' },
+    { name: 'ttwid', value: 'y', domain: 'doubao.com' },
+    { name: 'SID', value: 'z', domain: '.google.com' },
+  ]);
+  assert.equal(r.doubao.length, 2);
+  assert.deepEqual(r.otherDomains, ['google.com']);
+});
 
 cdp.close();
 for (const k of Object.keys(browserMod.injectable)) browserMod.injectable[k] = null;

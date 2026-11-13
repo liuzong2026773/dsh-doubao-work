@@ -365,8 +365,7 @@ export async function grabAllCookies(wsUrl, deps = {}, timeoutMs = 8000) {
 }
 
 /**
- * 一步到位：探测端口 → 抓 Cookie → 过滤豆包域 → 判断是否已登录。
- * notLoggedIn 时调用方让用户登录后再点一次。
+ * 一步到位：探测端口 → 抓 Cookie → 过滤豆包域 → 判断是否已登录。 * notLoggedIn 时调用方让用户登录后再点一次。
  */
 export async function grabDoubao(opts = {}, deps = {}) {
   const d = makeDeps(deps);
@@ -386,4 +385,96 @@ export async function grabDoubao(opts = {}, deps = {}) {
     browser: probe.browser,
     reason: hasAuth ? '' : `端口通、拿到了 ${keys.length} 个豆包 Cookie，但里面还没有 ${AUTH_MARKERS.join('/')}——请在打开的窗口里登录豆包后再点一次「抓取」`,
   };
+}
+
+/**
+ * 从 CDP 抓到的全部 Cookie 里，提取「其他域名」的字典（只给 model_item_key 探测工具用）：
+ * 豆包的模型列表实际由前端从 gateway 拉取，key 在响应里；这里不猜接口，只把
+ * 浏览器实际存过的 doubao 域 Cookie 按域分组回出去，排障时能看清登录态覆盖了哪些子域。
+ */
+export function groupCookiesByDomain(cookies, domains = DOUBAO_DOMAINS) {  const ours = [];
+  const others = new Map();
+  for (const c of cookies || []) {
+    const dom = String(c.domain || '').replace(/^\./, '');
+    if (!dom) continue;
+    if (domains.some(d0 => dom === d0 || dom.endsWith('.' + d0) || dom.endsWith(d0))) ours.push(c);
+    else if (!others.has(dom)) others.set(dom, []);
+  }
+  return { doubao: ours, otherDomains: [...others.keys()].sort() };
+}
+
+// ---------------- model_item_key 抓取（给「补齐 8 个模型」用） ----------------
+
+/**
+ * 从一次 chat/completion 的请求体里抽出 model_item_key。
+ * 纯函数：抓包里 model_item_key 同时出现在 conversation_init_ext 与 model_config，
+ * 两处取任意一处即可；格式不对返回 null（不猜）。
+ */
+export function extractModelItemKey(postData) {
+  if (typeof postData !== 'string' || !postData) return null;
+  let body;
+  try { body = JSON.parse(postData); } catch { return null; }
+  const opt = body?.option || body;
+  const key = opt?.conversation_init_ext?.model_item_key
+    ?? opt?.model_config?.model_item_key
+    ?? null;
+  return typeof key === 'string' && key.trim() ? key.trim() : null;
+}
+
+/**
+ * 连已登录的豆包页面，监听网络请求，把用户手选的模型对应的 model_item_key 抓出来。
+ * 只用 Network 域（只读观察），不注入脚本、不改页面。
+ */
+export async function captureModelKeys(opts = {}, deps = {}) {
+  const d = makeDeps(deps);
+  const port = Number(opts.port) || 9222;
+  const timeoutMs = Number(opts.timeoutMs) || 120000;
+  const onKey = typeof opts.onKey === 'function' ? opts.onKey : () => {};
+  const seen = [];
+  const probe = await probeDebugPort(port, deps, 1500);
+  if (!probe.ok) throw new Error(`127.0.0.1:${port} 没有响应（${probe.reason}）`);
+
+  // 页面级 target 才有 Network 域
+  const listRes = await d.fetchImpl(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) });
+  const targets = await listRes.json();
+  const page = (targets || []).find(t => t.type === 'page' && /doubao\.com/.test(t.url || ''))
+    || (targets || []).find(t => t.type === 'page');
+  if (!page || !page.webSocketDebuggerUrl) throw new Error('没找到豆包页面标签页（先在窗口里打开 www.doubao.com 并登录）');
+
+  return await new Promise((resolve, reject) => {
+    let ws;
+    let done = false;
+    const finish = (err) => {
+      if (done) return;
+      done = true;
+      try { ws && ws.close(); } catch { /* ignore */ }
+      if (err) reject(err); else resolve(seen);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    if (typeof timer.unref === 'function') timer.unref();
+    try { ws = d.createSocket(page.webSocketDebuggerUrl); } catch (e) { clearTimeout(timer); return reject(e); }
+    ws.addEventListener('open', () => {
+      ws.send(JSON.stringify({ id: 1, method: 'Network.enable', params: {} }));
+      if (opts.onOpen) opts.onOpen();
+    });
+    ws.addEventListener('message', (ev) => {
+      if (done) return; // 已结束（超时/达到 stopAfter）之后到的事件一律忽略
+      let msg;
+      try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch { return; }
+      if (msg.id === 1 && msg.error) { clearTimeout(timer); return finish(new Error('Network.enable 失败：' + (msg.error.message || '未知'))); }
+      if (msg.method !== 'Network.requestWillBeSent') return;
+      const req = msg.params?.request || {};
+      if (!/chat\/completion/.test(req.url || '')) return;
+      const key = extractModelItemKey(req.postData);
+      if (!key) return;
+      const item = { key, url: req.url, at: Date.now() };
+      seen.push(item);
+      onKey(item);
+      if (opts.stopAfter && seen.length >= opts.stopAfter) { clearTimeout(timer); finish(null); }
+    });
+    ws.addEventListener('error', (e) => {
+      clearTimeout(timer);
+      finish(new Error('WebSocket 失败：' + (e?.message || '连接被拒')));
+    });
+  });
 }
