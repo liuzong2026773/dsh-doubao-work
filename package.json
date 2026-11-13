@@ -1,6 +1,6 @@
 {
   "name": "dsh-doubao-work",
-  "version": "1.2.0",
+  "version": "1.2.3",
   "type": "module",
   "main": "index.js",
   "exports": {
@@ -32,6 +32,9 @@
   "peerDependencies": {
     "@deepseek-ai/schemastery": ">=3.18.0",
     "@deepseek-ai/dsh-llm": ">=0.0.1-rc.1"
+  },
+  "engines": {
+    "node": ">=20"
   },
   "license": "MIT",
   "dsh": {
