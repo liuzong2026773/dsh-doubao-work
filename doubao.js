@@ -802,9 +802,13 @@ export class DoubaoClient {
     return this.baseUrl + '/chat/completion?' + p.toString();
   }
 
-  /** 合并"上游超时"与调用方取消信号，避免 SSE 卡死到 DSH 超时 */
-  _withTimeout(signal) {
-    const ms = this.cfg.requestTimeoutMs ?? 180000;
+  /**
+   * 合并"上游超时"与调用方取消信号，避免 SSE 卡死到 DSH 超时。
+   * extraMs：单次调用放宽上限。生图/生视频/出文件动辄两三分钟，
+   * 用默认 180s 会把正在生成的任务掐掉（实测 PPT 跑到 182s 直接 aborted）。
+   */
+  _withTimeout(signal, extraMs = 0) {
+    const ms = Math.max(Number(extraMs) || 0, this.cfg.requestTimeoutMs ?? 180000);
     const t = AbortSignal.timeout(ms);
     if (!signal) return t;
     try { return AbortSignal.any([signal, t]); } catch (e) { return signal; }
@@ -930,6 +934,8 @@ export class DoubaoClient {
     const acc = options.account || this._pickAccount(options.id);
     if (!acc) throw new DoubaoError('noaccount', '没有可用账号（先导入一个 Cookie）');
     const spec = { chatMode: true, modelItemKey: '0', itemId: 0, images: Array.isArray(options.images) ? options.images.filter(im => im && im.uri) : [] };
+    // 让单次上游请求知道这次要等多久（生文件/生视频超过默认 180s）
+    spec.timeoutMs = Number(options.timeoutMs) || Math.max(Number(this.cfg.requestTimeoutMs) || 180000, 600000);
     const attempt = { text: '', conversationId: '', ackModelItemKey: '' };
     if (options.dump) attempt.dump = String(options.dump);
     const ctrl = new AbortController();
@@ -1142,7 +1148,7 @@ export class DoubaoClient {
     /** 归类中止：区分"调用方取消"和"上游超时"，两者在 DSH 里处置方式不同 */
     const abortKind = (e) => {
       if (signal?.aborted) return new DoubaoError('aborted', '请求已取消');
-      if (e?.name === 'TimeoutError') return new DoubaoError('timeout', `上游超时（${this.cfg.requestTimeoutMs ?? 180000}ms）`);
+      if (e?.name === 'TimeoutError') return new DoubaoError('timeout', `上游超时（${Math.max(Number(modelItemKey && modelItemKey.timeoutMs) || 0, this.cfg.requestTimeoutMs ?? 180000)}ms）`);
       return null;
     };
 
@@ -1159,7 +1165,7 @@ export class DoubaoClient {
           accept: 'text/event-stream',
         },
         body: JSON.stringify(this._buildBody(text, modelItemKey, conversationId)),
-        signal: this._withTimeout(signal),
+        signal: this._withTimeout(signal, Number(modelItemKey && modelItemKey.timeoutMs) || 0),
       });
     } catch (e) {
       throw abortKind(e) || new DoubaoError('network', `上游网络错误: ${e.message}`);
