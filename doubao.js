@@ -132,8 +132,9 @@ export class DoubaoClient {
     return this._accounts().filter(a => this._accState(a.id).coolUntil <= now);
   }
 
-  pickAccount(excludeId) {
-    const pool = this._validAccounts().filter(a => a.id !== excludeId);
+  pickAccount(exclude) {
+    const skip = exclude instanceof Set ? exclude : (exclude ? new Set([exclude]) : new Set());
+    const pool = this._validAccounts().filter(a => !skip.has(a.id));
     if (pool.length === 0) return null;
     const now = Date.now();
     const notLimited = pool.filter(a => {
@@ -143,8 +144,9 @@ export class DoubaoClient {
     });
     const usable = notLimited.length ? notLimited : pool;
     if ((this.cfg.strategy === 'random') && usable.length > 1) return usable[Math.floor(Math.random() * usable.length)];
-    this.roundIndex = (this.roundIndex + 1) % usable.length;
-    return usable[this.roundIndex];
+    const idx = this.roundIndex % usable.length;
+    this.roundIndex = (idx + 1) % usable.length;
+    return usable[idx];
   }
 
   _rpmWaitMs(acc) {
@@ -246,6 +248,32 @@ export class DoubaoClient {
     return 'https://www.doubao.com/chat/completion?' + p.toString();
   }
 
+  /** 合并"上游超时"与调用方取消信号，避免 SSE 卡死到 DSH 超时 */
+  _withTimeout(signal) {
+    const ms = this.cfg.requestTimeoutMs ?? 180000;
+    const t = AbortSignal.timeout(ms);
+    if (!signal) return t;
+    try { return AbortSignal.any([signal, t]); } catch (e) { return signal; }
+  }
+
+  /** 查询单账号订阅额度（/alice/commerce/sale/subscription/quota/summary/，实测可用） */
+  async getQuota(account) {
+    let res;
+    try {
+      res = await fetch('https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/?aid=497858&version_code=20800', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', cookie: account.cookie.trim(), 'user-agent': UA },
+        body: '{}',
+        signal: this._withTimeout(),
+      });
+    } catch (e) {
+      throw new DoubaoError('network', '额度查询网络错误: ' + e.message);
+    }
+    const t = await res.text().catch(() => '');
+    if (!res.ok) throw new DoubaoError(res.status === 401 ? 'auth' : 'upstream', '额度查询 HTTP ' + res.status);
+    try { return JSON.parse(t); } catch (e) { throw new DoubaoError('upstream', '额度查询返回非 JSON'); }
+  }
+
   _buildBody(text, modelItemKey) {
     const now = Date.now();
     return {
@@ -304,7 +332,7 @@ export class DoubaoClient {
           accept: 'text/event-stream',
         },
         body: JSON.stringify(this._buildBody(text, modelItemKey)),
-        signal,
+        signal: this._withTimeout(signal),
       });
     } catch (e) {
       throw new DoubaoError('network', `上游网络错误: ${e.message}`);
@@ -334,8 +362,11 @@ export class DoubaoClient {
       while (!ended) {
         if (signal?.aborted) throw new DoubaoError('aborted', '请求已取消');
         const { done, value } = await reader.read();
-        if (done) break;
-        buf += dec.decode(value, { stream: true });
+        // flush 尾部残留字节，避免多字节字符被截断
+        if (done) buf += dec.decode();
+        else buf += dec.decode(value, { stream: true });
+        // 兼容 CRLF 分帧的 SSE
+        if (buf.includes('\r\n')) buf = buf.replace(/\r\n/g, '\n');
         let idx;
         while ((idx = buf.indexOf('\n\n')) !== -1) {
           const raw = buf.slice(0, idx);
@@ -380,6 +411,8 @@ export class DoubaoClient {
 
     const ms = Date.now() - startedAt;
     st.totalChars += full.length;
+    st.authError = false; // 换新 Cookie 后自动恢复，不再永久显示"失效"
+    st.lastError = '';
     this._scheduleSave();
     this.log('info', `上游完成 账号=${account.id} 字数=${full.length} 耗时=${ms}ms`, { acc: account.id, ms, chars: full.length });
 
@@ -395,10 +428,10 @@ export class DoubaoClient {
     const modelItemKey = this.resolveModelItemKey(modelId);
     if (!modelItemKey) throw new DoubaoError('upstream', `未知模型 ${modelId}`);
     const maxAttempts = Math.max(1, this.cfg.maxAttempts ?? 2);
-    let usedId = null;
+    const tried = new Set();
     let lastErr = null;
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-      const acc = this.pickAccount(usedId);
+      const acc = this.pickAccount(tried);
       if (!acc) {
         const accounts = this._accounts();
         if (accounts.length === 0) throw new DoubaoError('noaccount', '没有可用账号：请检查 accounts 配置（cookie 是否已填、是否启用）');
@@ -407,9 +440,15 @@ export class DoubaoClient {
         const waitSec = Math.ceil((st.coolUntil - Date.now()) / 1000);
         throw new DoubaoError('ratelimit', waitSec > 0 ? `全部账号冷却中，约 ${waitSec}s 后重试` : '全部账号限速中，请稍后重试');
       }
-      usedId = acc.id;
+      tried.add(acc.id);
       const wait = this._rpmWaitMs(acc);
-      if (wait > 0 && wait < 15000) await new Promise(r => setTimeout(r, wait));
+      if (wait > 20000) {
+        // 等太久不值得，直接换号，避免"超时就直接发"绕过单账号 RPM
+        lastErr = new DoubaoError('ratelimit', '账号 ' + acc.id + ' 已达单账号 RPM 上限，约 ' + Math.ceil(wait / 1000) + 's 后可用');
+        this.log('warn', '账号 ' + acc.id + ' 达到 RPM 上限，跳过换号');
+        continue;
+      }
+      if (wait > 0) await new Promise(r => setTimeout(r, wait));
       try {
         const full = yield* this.chatOnce(acc, modelItemKey, text, signal);
         return full;
