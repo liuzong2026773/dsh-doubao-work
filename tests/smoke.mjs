@@ -35,7 +35,7 @@ const ctx = {
 console.log('加载与注册');
 ok('apply 不抛异常', () => mod.apply(ctx, { providerId: 'doubao-work', providerName: '测试', accounts: [] }));
 ok('注册了 provider', () => assert.deepEqual(adapterProviders, ['doubao-work']));
-ok('注册了 5 条路由', () => assert.equal(Object.keys(routes).length, 5));
+ok('注册了 6 条路由（5 精确 + 1 /api 前缀）', () => assert.equal(Object.keys(routes).length, 6));
 ok('拿不到 webServer 时降级不崩', () => {
   const noop = { llm: { registerAdapter() {} }, get: () => undefined };
   mod.apply(noop, { providerId: 'doubao-work', accounts: [] });
@@ -49,6 +49,7 @@ function call(path, body) {
       end(b) { this.buf += String(b ?? ''); resolve({ code: this.code, body: this.buf }); },
     };
     const req = new EventEmitter();
+    req.url = path;
     const p = routes[path].handler(req, res);
     if (body !== undefined) req.emit('data', JSON.stringify(body));
     req.emit('end');
@@ -72,6 +73,12 @@ ok('账号行含额度估算字段', () => {
   }
 });
 
+const viaApi = await call('/api/doubao', undefined);
+ok('/api/doubao 前缀转发到 status', () => {
+  assert.equal(viaApi.code, 200);
+  assert.ok(JSON.parse(viaApi.body).models);
+});
+
 const addBad = await call('/doubao/account/add', { cookie: 'short' });
 ok('短 Cookie 被拒绝（400）', () => assert.equal(addBad.code, 400));
 
@@ -79,12 +86,17 @@ const gating = await import('../doubao.js');
 console.log('会话复用闸门');
 ok('严格追加才复用', () => {
   const c = new gating.DoubaoClient({ accounts: [] }, {});
-  c.rememberConversation('k', 'cid', 3);
-  assert.equal(c.reusableConversation('k', 4), 'cid');
-  assert.equal(c.reusableConversation('k', 3), null);
-  assert.equal(c.reusableConversation('k', 5), null);
-  assert.equal(c.reusableConversation('unknown', 1), null);
-  assert.equal(c.reusableConversation('k', 4), 'cid', '重复查询应保持不变');
+  c.rememberConversation('k', 'cid', 3, '上一轮回复');
+  assert.equal(c.reusableConversation('k', 4, '上一轮回复'), 'cid');
+  assert.equal(c.reusableConversation('k', 3, '上一轮回复'), null);
+  assert.equal(c.reusableConversation('k', 5, '上一轮回复'), null);
+  assert.equal(c.reusableConversation('unknown', 1, ''), null);
+  assert.equal(c.reusableConversation('k', 4, '上一轮回复'), 'cid', '重复查询应保持不变');
+});
+ok('回复内容不一致则不复用（防串会话）', () => {
+  const c = new gating.DoubaoClient({ accounts: [] }, {});
+  c.rememberConversation('k', 'cid', 3, '上一轮回复');
+  assert.equal(c.reusableConversation('k', 4, '被改写过的历史'), null);
 });
 ok('contextReuse=false 时永不复用', () => {
   const c = new gating.DoubaoClient({ accounts: [], contextReuse: false }, {});
