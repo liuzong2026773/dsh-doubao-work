@@ -1,0 +1,29 @@
+{
+  "port": 3040,
+  "apiKey": "",
+  "strategy": "round-robin",
+  "rpmPerAccount": 6,
+  "globalMaxConcurrency": 2,
+  "coolSeconds": 86400,
+  "shortCoolSeconds": 300,
+  "queueWaitMs": 30000,
+  "requestTimeoutMs": 180000,
+  "maxAttempts": 2,
+  "defaultModel": "deepseek-v4.1-flash",
+  "models": {
+    "deepseek-v4.1-flash": "person-deepseek-v4-1-flash-261017",
+    "doubao-2.1-lite": "seed-lite-7b"
+  },
+  "upstream": {
+    "aid": "497858",
+    "version_code": "20800",
+    "pc_version": "3.45.5",
+    "language": "zh",
+    "region": "CN",
+    "tz_name": "Asia/Shanghai",
+    "device_id": "7707509248230065699",
+    "web_id": "7707509253662393906",
+    "tea_uuid": "7707509253662393906",
+    "fp": "verify_mwehdj77_p7te0LWd_xEFZ_4N2S_8jDq_L7Zl4uO5iI5F"
+  }
+}
