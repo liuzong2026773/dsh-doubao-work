@@ -93,6 +93,18 @@ dsh-doubao-work/
 
 `standalone/` 目录是同内核的独立 OpenAI 兼容网关（`node index.js`，默认 `127.0.0.1:3040/v1`），适合不想装插件、或想给其他 OpenAI 客户端/中转站供流的场景。配置 `config.json` + `accounts.json`（填 Cookie）后启动。
 
+## 运维小工具（无需面板）
+
+```bash
+node tools/status.mjs          # 账号池状态：冷却到几点、累计用量、最近错误
+node tools/status.mjs --check  # 额外校验每个账号 Cookie 是否还有效
+node tools/status.mjs --quota  # 额外查询每个账号的订阅额度
+```
+
+## 接口实测记录
+
+抓包结论、模型 `model_item_key` 对照表、SSE 事件表、额度接口、以及**尚未抓到**的签到接口和补抓方法，见 [`docs/豆包接口实测-2026-11-13.md`](docs/豆包接口实测-2026-11-13.md)。
+
 ## License
 
 MIT
