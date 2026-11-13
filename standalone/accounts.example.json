@@ -1,0 +1,10 @@
+﻿{
+    "accounts":  [
+                     {
+                         "remark":  "示例账号",
+                         "enabled":  true,
+                         "id":  "acc-1",
+                         "cookie":  "在这里粘贴豆包网页版完整Cookie"
+                     }
+                 ]
+}
