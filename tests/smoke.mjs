@@ -19,20 +19,25 @@ ok('导出 name/apply/inject', () => {
   assert.equal(typeof mod.apply, 'function');
   assert.ok(Array.isArray(mod.inject), 'inject 必须是数组（对象写法会让 cordis 等 required/optional）');
   assert.ok(mod.inject.includes('llm'));
-  assert.ok(mod.inject.includes('webServer'));
+  assert.ok(!mod.inject.includes('webServer'), 'webServer 必须按可选获取，硬依赖会让插件一直 pending');
 });
 
 const routes = {};
 let adapterProviders = null;
+const webServer = { register: (r) => { routes[r.path] = r; return () => {}; } };
 const ctx = {
   llm: { registerAdapter: (p) => { adapterProviders = p; } },
-  webServer: { register: (r) => { routes[r.path] = r; return () => {}; } },
+  get: (name) => (name === 'webServer' ? webServer : undefined),
 };
 
 console.log('加载与注册');
 ok('apply 不抛异常', () => mod.apply(ctx, { providerId: 'doubao-work', providerName: '测试', accounts: [] }));
 ok('注册了 provider', () => assert.deepEqual(adapterProviders, ['doubao-work']));
 ok('注册了 5 条路由', () => assert.equal(Object.keys(routes).length, 5));
+ok('拿不到 webServer 时降级不崩', () => {
+  const noop = { llm: { registerAdapter() {} }, get: () => undefined };
+  mod.apply(noop, { providerId: 'doubao-work', accounts: [] });
+});
 
 function call(path, body) {
   return new Promise((resolve) => {
