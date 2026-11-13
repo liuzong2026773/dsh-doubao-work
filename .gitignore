@@ -1,0 +1,8 @@
+# 账号与运行状态：含 Cookie，严禁提交
+accounts.json
+cookie-header.json
+gateway-state.json
+logs/
+*.cookie
+.env
+node_modules/
