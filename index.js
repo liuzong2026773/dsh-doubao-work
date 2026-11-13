@@ -208,11 +208,14 @@ export function apply(ctx, config) {
   // ---------------- 状态接口（本机只读） ----------------
   // GET  /doubao/status  → 账号池 + 今日用量 + 会话数
   // POST /doubao/check   → 逐个账号做健康检查
-  try {
-    // 不硬依赖 webServer：该服务在部分启动阶段可能未 ready，硬依赖会让插件一直 pending。
-    // ctx.get 是 cordis 提供的"不声明 inject 也能读服务"的出口，拿不到就降级。
-    const web = typeof ctx.get === 'function' ? ctx.get('webServer') : undefined;
-    if (web?.register) {
+  let statusRoutesRegistered = false;
+
+  /** 拿到 webServer 才注册；重复调用安全 */
+  const registerStatusRoutes = (web) => {
+    if (statusRoutesRegistered) return;
+    if (!web || typeof web.register !== 'function') return;
+    statusRoutesRegistered = true;
+    try {
       web.register({
         kind: 'exact',
         path: '/doubao/status',
@@ -315,12 +318,45 @@ export function apply(ctx, config) {
         },
       });
       log('info', '状态接口已注册：GET /doubao/status  POST /doubao/check');
-    } else {
-      log('warn', '未拿到 webServer 服务，状态接口不可用（命令行工具仍可用）');
+    } catch (e) {
+      statusRoutesRegistered = false;
+      log('warn', '状态接口注册失败：' + e.message);
     }
-  } catch (e) {
-    log('warn', '状态接口注册失败：' + e.message);
-  }
+  };
+
+  // webServer 在 apply 阶段往往还没 ready（实测 ctx.get 此时为 undefined），
+  // 所以：① 声明可选依赖，等它 ready 后回调；② 再用轮询兜底，确保只注册一次。
+  try {
+    if (typeof ctx.inject === 'function') {
+      // 与 dsh-free-model 相同的写法：apply 时 webServer 还没 provide，
+      // 声明依赖后 cordis 会在服务就绪时回调，用 scoped.effect 管注册生命周期。
+      ctx.inject(['webServer'], (scoped) => {
+        try {
+          const server = scoped.webServer;
+          scoped.effect(() => {
+            registerStatusRoutes(server);
+            return () => { statusRoutesRegistered = false; };
+          }, 'dsh-doubao-work: status routes');
+        } catch (e) { log('warn', '延迟注入注册失败：' + e.message); }
+      });
+    }
+  } catch (e) { log('warn', 'ctx.inject 不可用：' + e.message); }
+
+  try {
+    if (!statusRoutesRegistered) {
+      const poll = () => {
+        if (statusRoutesRegistered) return true;
+        let web;
+        try { web = typeof ctx.get === 'function' ? ctx.get('webServer') : undefined; } catch (e) { web = undefined; }
+        if (web && typeof web.register === 'function') { registerStatusRoutes(web); return true; }
+        return false;
+      };
+      if (!poll()) {
+        const timer = setInterval(() => { if (poll()) clearInterval(timer); }, 1000);
+        if (typeof timer.unref === 'function') timer.unref();
+      }
+    }
+  } catch (e) { log('warn', '状态接口兜底注册失败：' + e.message); }
 
   // 进程退出时落盘状态
   const flush = () => client.flushState();
