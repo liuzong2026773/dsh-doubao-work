@@ -38,6 +38,39 @@
 - **失败自动换号重试**
 - **扩展模型**：后续抓到新的 `model_item_key` 可在 `extraModels` 配置里加
 
+## 多账号与 Cookie 导入/导出（accounts.json）
+
+账号有两种添加方式，可混用：
+
+**方式 A：DSH 插件配置面板** —— 在 `accounts` 数组里加一项，填 `cookie` + `remark`，由 DSH 自己持久化配置。
+
+**方式 B：accounts.json 文件（推荐，改文件即生效，无需重启 DSH）** —— 在插件目录放一个 `accounts.json`：
+
+```json
+{
+  "accounts": [
+    { "id": "acc-1", "cookie": "整段豆包Cookie……", "remark": "主号", "enabled": true },
+    { "id": "acc-2", "cookie": "整段豆包Cookie……", "remark": "小号", "enabled": true }
+  ]
+}
+```
+
+- 每次调用前检查文件修改时间，**改完保存立即生效**（加号、换 Cookie、临时禁用 `enabled: false` 都不用重启）
+- 同 `id` 时文件账号优先于配置面板账号
+- **导出**：复制这个 `accounts.json` 就是完整账号备份
+- **导入**：把文件放进另一台设备的插件目录即完成迁移
+- 运行状态（冷却倒计时/用量统计）另存于插件目录 `gateway-state.json`，不影响账号数据
+
+> 手机 DSH 小技巧：如果手机上不便直接编辑文件，可以直接对 DSH 说“把这段 Cookie 写进插件目录的 accounts.json，格式是……”让它代写。
+
+## 获取新账号的 Cookie
+
+每个豆包账号各自登录网页版抓一次：
+
+1. 浏览器（建议开无痕窗口）打开 [www.doubao.com](https://www.doubao.com) 并登录该账号
+2. `F12` → Network → 随便点一个请求 → Request Headers → 复制整条 `Cookie` 值
+3. 加进 `accounts.json` 的一个新条目（`id` 别重复）
+
 ## 已知限制（如实说明）
 
 - **不支持工具调用（function calling）**：豆包对话接口没有该能力，本模型适合对话/写作/问答，**不适合当 Agent 主循环模型**
