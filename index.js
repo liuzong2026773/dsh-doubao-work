@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export const name = 'dsh-doubao-work';
-export const inject = { required: ['llm'], optional: ['webServer'] };
+export const inject = ['llm', 'webServer'];
 
 // ---------------- 配置面板 ----------------
 
@@ -264,6 +264,29 @@ export function apply(ctx, config) {
           res.end(JSON.stringify({ ok: true }));
         },
       });
+      web.register({
+        kind: 'exact',
+        path: '/doubao/account/add',
+        handler: async (req, res) => {
+          const body = JSON.parse((await readBody(req)) || '{}');
+          const cookie = typeof body.cookie === 'string' ? body.cookie.trim() : '';
+          if (cookie.length < 20) {
+            res.writeHead(400, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'Cookie 太短，疑似无效' }));
+          }
+          const list = readAccountsFile();
+          const id = (body.id || '').trim() || ('acc-' + (list.length + 1));
+          if (list.some(a => a.id === id)) {
+            res.writeHead(409, { 'content-type': 'application/json' });
+            return res.end(JSON.stringify({ error: 'id 已存在：' + id }));
+          }
+          list.push({ id, remark: (body.remark || '').trim(), cookie, enabled: true });
+          writeAccountsFile(list);
+          res.writeHead(200, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ok: true, id }));
+        },
+      });
+
       web.register({
         kind: 'exact',
         path: '/doubao/account/remove',
