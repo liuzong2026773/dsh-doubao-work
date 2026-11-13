@@ -35,6 +35,7 @@ const ExtraModelSchema = Schema && Schema.object({
   id: Schema.string().description('模型 ID（DSH 中显示的调用名）').required(),
   name: Schema.string().description('显示名称').default(''),
   modelItemKey: Schema.string().description('豆包 model_item_key（抓包获取）').required(),
+  itemId: Schema.number().description('模型 item_id（网页版 option.need_deep_think 的值，决定真正用哪个模型；4.1 flash=10001）').default(0),
 });
 
 export const Config = Schema && Schema.object({
@@ -52,6 +53,7 @@ export const Config = Schema && Schema.object({
   extraModels: Schema.array(ExtraModelSchema).description('扩展模型（后续抓到新 model_item_key 可加）').default([]),
   reasoningEffort: Schema.number().description('推理档位 0-3。0=真流式（推荐，边生成边到达）；1-3=先推理完再整段返回，质量更高但没有流式体感').min(0).max(3).default(0),
   contextReuse: Schema.boolean().description('复用豆包会话做多轮上下文（只在历史严格追加时复用，实测有效）').default(true),
+  sendSystemPrompt: Schema.boolean().description('把宿主的系统提示词（含工具说明）也发给豆包。默认关闭：豆包用不到这些工具，白吃额度还会泄露本机信息').default(false),
   conversationTtlSec: Schema.number().description('会话复用有效期（秒），超时后新建会话').min(60).default(1800),
 
   // ---- 以下为上游/运行时参数：doubao.js 会读取，此前未在 Schema 声明，
@@ -81,7 +83,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.5.0';
+export const VERSION = '1.5.1';
 
 /**
  * 配置默认值。
@@ -102,6 +104,7 @@ export const DEFAULTS = {
   extraModels: [],
   reasoningEffort: 0,
   contextReuse: true,
+  sendSystemPrompt: false,
   conversationTtlSec: 1800,
   baseUrl: 'https://www.doubao.com',
   requestTimeoutMs: 180000,
@@ -201,6 +204,10 @@ export const ERROR_CODES = {
 /** DSH Message[] + system → 豆包单段文本（每次新建会话，需自带完整上下文） */
 export function messagesToText(options) {
   const msgs = options.messages || [];
+  // 宿主的系统提示词（含工具说明）默认不透传：豆包那边既用不到这些工具，
+  // 又白吃额度、把本机环境细节漏给第三方页面。要透传再开 sendSystemPrompt。
+  const keepSystem = options.sendSystemPrompt === true;
+  const system = keepSystem ? String(options.system || '') : '';
   const roleOf = (m) => {
     if (m.role === 'assistant') return 'AI';
     if (m.role === 'system') return '系统';
@@ -210,12 +217,13 @@ export function messagesToText(options) {
   const last = msgs[msgs.length - 1];
   const lastText = last ? blockText(last.content) : '';
   // 单条用户消息直发（最常见 & 最稳）
-  if (msgs.length === 1 && msgs[0].role === 'user' && !options.system) {
+  if (msgs.length === 1 && msgs[0].role === 'user' && !system) {
     return lastText;
   }
   const lines = [];
-  if (options.system) lines.push(`系统: ${options.system}`);
+  if (system) lines.push(`系统: ${system}`);
   for (const m of msgs) {
+    if (m.role === 'system' && !keepSystem) continue;
     let text = blockText(m.content);
     if (m.source?.kind === 'tool') {
       text = text || JSON.stringify(m.content?.find(b => b.type === 'tool-result')?.content ?? '');
@@ -298,7 +306,7 @@ export class DoubaoLlmAdapter extends AdapterBase {
     const reuseOk = !!(reuseId && tailText.trim());
     const lastMsg = msgs[msgs.length - 1];
     const lastText = lastMsg ? blockText(lastMsg.content) : '';
-    const text = reuseOk ? tailText : messagesToText(options);
+    const text = reuseOk ? tailText : messagesToText({ ...options, sendSystemPrompt: this.deps.config.sendSystemPrompt === true });
     // 留痕给 /doubao/status：本轮到底复用没复用、从第几条开始发
     client.lastReuse = {
       reused: reuseOk,
@@ -1001,13 +1009,14 @@ export function apply(ctx, rawConfig) {
           const body = await parseBody(req);
           const key = typeof body?.key === 'string' ? body.key.trim() : '';
           if (!key) return json(res, 400, { ok: false, error: '需要 key：要验证的 model_item_key' });
+          const itemId = Number(body?.itemId) || 0;
           const id = typeof body?.id === 'string' ? body.id : '';
           const list = client.allAccounts().filter(a => a.enabled !== false);
           const account = id ? list.find(a => a.id === id) : list[0];
           if (!account) return json(res, 400, { ok: false, error: '没有可用账号（先导入一个 Cookie）' });
           try {
-            const r = await client.probeModelKey(account, key);
-            json(res, 200, { ...r, account: account.id, key });
+            const r = await client.probeModelKey(account, { modelItemKey: key, itemId, extraParams: {} });
+            json(res, 200, { ...r, account: account.id, key, itemId });
           } catch (e) {
             json(res, 500, { ok: false, error: String(e.message || e) });
           }

@@ -126,8 +126,14 @@ Application 包装层的布局也认）。想用别的内核浏览器，在插�
 - **每日自动签到**（1.4.0）：面板「一键签到」（整池或单号）+ 配置 `checkinSchedule: "09:30"` 后每天自动签，
   启动时若当天还没签会自动补一次
 - **账号包导出/导入**（1.4.0）：面板一键把全部账号导出成一段 JSON，换设备/传手机后粘贴导入
-- **扩展模型**：后续抓到新的 `model_item_key` 可在 `extraModels` 配置里加，
-  用 `node tools/model-probe.mjs --capture` 抓、`--key` 验证（见「运维小工具」）
+- **模型切换真的生效**（1.5.1）：豆包工作模式的模型由 `option.need_deep_think`（模型 `item_id`）
+  决定，`model_item_key` 只是辅助。三件套一起发才对：
+  `need_deep_think=10001` + `model_config.model_extra_params={memory_profile:"300k_230",total_window_size:"300000"}`
+  + `conversation_init_ext.agent_task_param`。只发 `model_item_key` 时上游会静默落回账号默认模型
+  （表现就是"选了 4.1 flash，豆包那边还是豆包 2.1"）
+- **扩展模型**：抓到新模型后，在 `extraModels` 里同时填 `modelItemKey` 和 `itemId`（网页版
+  `need_deep_think` 的值），用 `node tools/capture-chat.mjs` 抓、`/doubao/models/probe` 验证
+  （见「运维小工具」）
 
 ## 多账号与 Cookie 导入/导出（accounts.json）
 
@@ -234,8 +240,8 @@ dsh-doubao-work/
 离线自检（不重启、不联网、不耗额度）：
 
 ```bash
-node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/浏览器导入(CDP)/登录助手/自动导入/模型 key 抓取/签到/账号包/数据目录/错误码/流协议，共 116 项
-node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到/key 验证，共 20 项
+node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/浏览器导入(CDP)/登录助手/自动导入/模型 key 抓取/签到/账号包/数据目录/模型选择/错误码/流协议，共 119 项
+node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到/key 验证/流内报错，共 22 项
 node tests/standalone.mjs # 真启动 standalone 网关（临时目录 + 假上游）：OpenAI 形状/流式/白名单/会话复用，9 项
 ELECTRON_RUN_AS_NODE=1 "<安装目录>/DeepSeek Harness.exe" tests/browser-live.mjs
                           # 真开浏览器 + 本地假登录页，验证登录助手真的能点开弹窗/填号/发码/登录，6 项
@@ -275,6 +281,9 @@ node tools/accounts.mjs export --out /tmp/backup.json
 node tools/browser-import.mjs --browser edge     # 命令行版「从浏览器导入」（--attach 连已开的调试端口）
 node tools/model-probe.mjs --list                # 已配置模型 ↔ model_item_key 对照
 node tools/model-probe.mjs --capture             # 抓新模型的 model_item_key（只开 Network 观察，不改页面）
+node tools/capture-chat.mjs                      # 自动发一句话，抓网页版 /chat/completion 的模型字段（need_deep_think/item_id）
+node tools/capture-chat.mjs --manual --wait 600  # 只观察不开火：你在窗口里切模型/发消息，它把请求体打出来
+node tools/capture-live.mjs --seconds 600        # 记录窗口里所有 /alice /biz /samantha 接口调用（排查用）
 node tools/model-probe.mjs --key <key>           # 验证某个 key 是否真生效（看 SSE_ACK 回写）
 ```
 
@@ -392,6 +401,20 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 
 ## 更新记录
 
+- **1.5.1**（2026-11-13，模型切换 + 两处误判）：
+  - **选了模型不生效（P0，已修）**：抓了网页版工作模式的真实请求，模型是 `option.need_deep_think`
+    （模型 `item_id`，4.1 flash = 10001）决定的，`model_item_key` 只作辅助。之前只发 key，
+    上游静默落回账号默认模型（`model_id` 恒为 38，怎么换 key 都不变）。现在三件套一起发：
+    `need_deep_think`、`model_config.model_extra_params`（`memory_profile`/`total_window_size`）、
+    `conversation_init_ext.agent_task_param`（工作台运行时），并补上 `conversation_mode: 2`。
+    实测同一句话：`need_deep_think=0` 回答"我是豆包…"，`=10001` 回答"模型名称属于内部细节，不便透露"，
+    两种行为确实不同。`extraModels` 新增 `itemId` 字段，`/doubao/models/probe` 也接受 `itemId`。
+  - **风控被误报为空响应（P1，已修）**：上游其实回了 `STREAM_ERROR 710022004 rate limited` +
+    `type=verify`（要求人机验证），旧代码忽略该事件，最后只剩"上游未返回内容"。现在按 `RATE_LIMIT`
+    上报并带错误码，日志和面板都能看出真因。
+  - **系统提示词不再外发（P1，已修）**：宿主每轮会把整段系统提示词（含工具说明）传给适配器，
+    旧实现原样拼进发给豆包的文本里——白吃额度，还把本机环境细节泄露给第三方页面。现在默认丢弃，
+    需要透传时把 `sendSystemPrompt` 设为 true。
 - **1.5.0**（2026-11-13，登录助手 + 自动导入，修「抓取失败 HTTP 500」）：
   - **修 P0：数据目录解析把函数当成路径**。宿主注册的是 `dshHomePath(...segments)` **函数**，
     旧代码 `String(ctx.get('dshHomePath'))` 把函数源码拼进了路径，于是

@@ -988,4 +988,40 @@ console.log('登录助手');
 cdp.close();
 for (const k of Object.keys(browserMod.injectable)) browserMod.injectable[k] = null;
 
+ok('系统提示词默认不透传（豆包看不到本地工具说明）', () => {
+  const msgs = [{ role: 'user', content: [{ type: 'text', text: '你好' }] }];
+  const t = mod.messagesToText({ system: 'You are an AI agent powered by deepseek-v4.1-flash\n工具说明……', messages: msgs });
+  assert.equal(t, '你好');
+  const t2 = mod.messagesToText({ system: 'SYS-MARK', sendSystemPrompt: true, messages: msgs });
+  assert.ok(t2.includes('SYS-MARK'), '显式开启时应透传');
+});
+ok('多轮时 system 也不会混进对话记录', () => {
+  const msgs = [
+    { role: 'system', content: [{ type: 'text', text: 'SYS-MARK' }] },
+    { role: 'user', content: [{ type: 'text', text: '第一句' }] },
+    { role: 'user', content: [{ type: 'text', text: '第二句' }] },
+  ];
+  const t = mod.messagesToText({ messages: msgs });
+  assert.ok(!t.includes('SYS-MARK'), t);
+  assert.match(t, /第一句/);
+});
+
+await ok('模型选择三件套：need_deep_think / model_extra_params / agent_task_param', async () => {
+  const { DoubaoClient } = await import('../doubao.js');
+  const client = new DoubaoClient({ accounts: [] }, {});
+  const spec = client.resolveModelSpec('deepseek-v4.1-flash');
+  assert.equal(spec.itemId, 10001, ' 4.1 flash 的 item_id 必须是 10001（网页版 need_deep_think）');
+  const body = client._buildBody('hi', spec, '');
+  const o = body.option;
+  assert.equal(o.need_deep_think, 10001, '模型靠 need_deep_think 切换，漏了就落回默认模型');
+  assert.equal(o.conversation_mode, 2);
+  assert.equal(o.agent_mode, 1);
+  assert.equal(o.conversation_init_ext.mode_id, '3');
+  assert.equal(o.conversation_init_ext.model_item_key, 'person-deepseek-v4-1-flash-261017');
+  const atp = JSON.parse(o.conversation_init_ext.agent_task_param);
+  assert.equal(atp.runtime_type, 1, '工作模式必须带 agent_task_param');
+  assert.equal(o.model_config.model_extra_params.memory_profile, '300k_230');
+  assert.equal(client.resolveModelSpec('doubao-2.1-lite').itemId, 0);
+});
+
 console.log('\n全部通过：' + passed + ' 项');

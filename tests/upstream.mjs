@@ -111,6 +111,17 @@ const server = http.createServer((req, res) => {
       },
     });
 
+    if (mode === 'streamerror') {
+      // 真实豆包的风控拒绝：HTTP 200，但流里先给 STREAM_ERROR
+      sse(res, 'STREAM_ERROR', {
+        error_code: 710022004, error_msg: 'rate limited',
+        extra: { decision: JSON.stringify({ code: '10000', type: 'verify', subtype: 'semantic_reasoning', verify_scene: 'doubao_message_web' }) },
+      });
+      sse(res, 'SSE_REPLY_END', { end_type: 3 });
+      res.end();
+      return;
+    }
+
     if (mode === 'empty') { sse(res, 'SSE_REPLY_END', {}); res.end(); return; }
 
     if (mode === 'midfail') {
@@ -361,6 +372,34 @@ await ok('probeModelKey：上游报错不炸，返回 ok:false 带原因', async
   assert.equal(r.ok, false);
   assert.match(r.error || '', /限流|429|风控/);
   upstream.defaultBehavior = 'ok';
+});
+
+// ---------------- 1.5.1：上游流内报错要如实归类，不能只剩「空响应」 ----------------
+await ok('STREAM_ERROR 710022004 判为限流而不是空响应', async () => {
+  upstream.defaultBehavior = 'streamerror';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  let err;
+  try {
+    for await (const _ of c.chat('deepseek-v4.1-flash', '你好', new AbortController().signal, {})) { /* drain */ }
+  } catch (e) { err = e; }
+  upstream.defaultBehavior = 'ok';
+  assert.ok(err, '应该抛错');
+  assert.equal(err.kind, 'ratelimit');
+  assert.match(err.message, /710022004/);
+  assert.match(err.message, /人机验证|限流/);
+});
+
+// ---------------- 1.5.1：模型选择必须体现在 need_deep_think 上 ----------------
+await ok('上游收到的请求带 need_deep_think=10001（模型才真的切过去）', async () => {
+  upstream.defaultBehavior = 'ok';
+  const c = makeClient([acc('a1', COOKIE_A)]);
+  const before = upstream.bodies.length;
+  for await (const _ of c.chat('deepseek-v4.1-flash', '你好', new AbortController().signal, {})) { /* drain */ }
+  const sent = upstream.bodies.slice(before).find(b => b && b.option);
+  assert.ok(sent, '应该发出请求');
+  assert.equal(sent.option.need_deep_think, 10001);
+  assert.equal(sent.option.conversation_init_ext.model_item_key, 'person-deepseek-v4-1-flash-261017');
+  assert.equal(sent.option.model_config.model_extra_params.memory_profile, '300k_230');
 });
 
 server.close();

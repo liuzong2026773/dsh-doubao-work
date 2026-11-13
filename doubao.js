@@ -62,8 +62,26 @@ export class DoubaoError extends Error {
 
 /** 内置模型映射（豆包工作 0.01x 限时优惠，实测抓包） */
 export const BUILTIN_MODELS = [
-  { id: 'deepseek-v4.1-flash', name: 'DeepSeek V4.1 Flash', description: '豆包工作·限时优惠 0.01x', modelItemKey: 'person-deepseek-v4-1-flash-261017' },
-  { id: 'doubao-2.1-lite', name: '豆包 2.1 Lite', description: '豆包工作·限时优惠 0.01x', modelItemKey: 'seed-lite-7b' },
+  {
+    id: 'deepseek-v4.1-flash',
+    name: 'DeepSeek V4.1 Flash',
+    description: '豆包工作·限时优惠 0.01x',
+    modelItemKey: 'person-deepseek-v4-1-flash-261017',
+    // 网页版切到这个模型时 option.need_deep_think = 10001（模型 item_id），
+    // 只发 model_item_key 上游不认，永远落回账号默认模型——这是"选了模型没生效"的根因。
+    itemId: 10001,
+    extraParams: { memory_profile: '300k_230', total_window_size: '300000' },
+    maxReasoningEffort: 4,
+  },
+  {
+    id: 'doubao-2.1-lite',
+    name: '豆包 2.1 Lite',
+    description: '豆包工作·限时优惠 0.01x',
+    modelItemKey: 'seed-lite-7b',
+    itemId: 0,
+    extraParams: {},
+    maxReasoningEffort: 3,
+  },
 ];
 
 export class DoubaoClient {
@@ -473,14 +491,16 @@ export class DoubaoClient {
    * 判据只看 SSE_ACK 里回写的 model_item_key（回写等于传入才算生效），不看模型自认知。
    * 发的是最短的一句话，尽量少吃额度。
    */
-  async probeModelKey(account, modelItemKey) {
+  async probeModelKey(account, modelLike) {
+    const spec = typeof modelLike === 'string' ? { modelItemKey: modelLike, itemId: 0, extraParams: {} } : (modelLike || {});
     const attempt = { text: '', conversationId: '', ackModelItemKey: '' };
     const ctrl = new AbortController();
     const timer = setTimeout(() => ctrl.abort(), Math.min(Number(this.cfg.requestTimeoutMs) || 60000, 60000));
     try {
-      for await (const _ of this.chatOnce(account, modelItemKey, '嗨', ctrl.signal, '', attempt)) { /* 只关心 ack */ }
+      for await (const _ of this.chatOnce(account, spec, '嗨', ctrl.signal, '', attempt)) { /* 只关心 ack */ }
       const echoed = attempt.ackModelItemKey || '';
-      return { ok: !!echoed && echoed === modelItemKey, echoed, text: attempt.text };
+      // 平台新版不再回写 model_item_key，回写缺失时只能算"未验证"而不是"失败"
+      return { ok: !!echoed && echoed === spec.modelItemKey, echoed, unverified: !echoed, itemId: spec.itemId || 0, text: attempt.text };
     } catch (e) {
       return { ok: false, echoed: attempt.ackModelItemKey || '', error: e.message };
     } finally {
@@ -555,6 +575,16 @@ export class DoubaoClient {
   }
 
   resolveModelItemKey(modelId) {
+    const spec = this.resolveModelSpec(modelId);
+    return spec ? spec.modelItemKey : null;
+  }
+
+  /**
+   * 模型 id → 完整选择参数。
+   * 网页版实际是「model_item_key + need_deep_think(item_id) + model_extra_params」三件套，
+   * 少任何一个上游都会落回默认模型。
+   */
+  resolveModelSpec(modelId) {
     const id = String(modelId || '').trim();
     if (!id) return null;
     const list = this.models();
@@ -567,7 +597,13 @@ export class DoubaoClient {
       const tail = id.slice(id.lastIndexOf('/') + 1);
       m = list.find(x => x.id === tail) || list.find(x => norm(x.id) === norm(tail));
     }
-    return m ? m.modelItemKey : null;
+    if (!m) return null;
+    return {
+      id: m.id,
+      modelItemKey: m.modelItemKey,
+      itemId: Number(m.itemId) || 0,
+      extraParams: m.extraParams && typeof m.extraParams === 'object' ? m.extraParams : {},
+    };
   }
 
   /** 当前插件实际支持的模型 id 列表（报错与面板排查用） */
@@ -630,10 +666,20 @@ export class DoubaoClient {
     try { return JSON.parse(t); } catch (e) { throw new DoubaoError('upstream', '额度查询返回非 JSON'); }
   }
 
-  _buildBody(text, modelItemKey, conversationId = '') {
+  /**
+   * 组装 /chat/completion 请求体。
+   * @param spec 模型选择参数：`{ modelItemKey, itemId, extraParams }`
+   *   —— 只给字符串时按 model_item_key 兼容旧调用。
+   */
+  _buildBody(text, spec, conversationId = '') {
     const now = Date.now();
-    // 推理档位：0 = 上游逐块流式；≥1 = 上游先推理完再整段返回（无流式体感）
-    const effort = Math.min(3, Math.max(0, Number(this.cfg.reasoningEffort ?? 0) || 0));
+    const m = typeof spec === 'string' ? { modelItemKey: spec, itemId: 0, extraParams: {} } : (spec || {});
+    const modelItemKey = m.modelItemKey || '';
+    // 网页版工作模式实测：模型由 need_deep_think(=item_id) 决定，
+    // model_item_key 只是辅助；推理档位可取到 4。
+    const itemId = Number(m.itemId) || 0;
+    const maxEffort = Number(m.maxReasoningEffort) || (itemId ? 4 : 3);
+    const effort = Math.min(maxEffort, Math.max(0, Number(this.cfg.reasoningEffort ?? 0) || 0));
     return {
       client_meta: {
         local_conversation_id: conversationId || ('gw_' + uuid()), conversation_id: conversationId, bot_id: BOT_ID,
@@ -646,20 +692,33 @@ export class DoubaoClient {
       }],
       option: {
         send_message_scene: '', create_time_ms: now, collect_id: '', is_audio: false,
-        answer_with_suggest: false, agent_mode: 1, tts_switch: false, need_deep_think: 0,
+        answer_with_suggest: false, agent_mode: 1, tts_switch: false, need_deep_think: itemId,
         click_clear_context: false, from_suggest: false, is_regen: false, is_replace: false,
         is_from_click_option: false, is_from_click_softlink: false, disable_sse_cache: false,
         select_text_action: '', is_select_text: false, resend_for_regen: false, scene_type: 0,
         unique_key: uuid(), start_seq: 0, need_create_conversation: !conversationId,
-        conversation_init_option: { need_ack_conversation: true },
-        conversation_init_ext: { model_item_key: modelItemKey, reasoning_effort: String(effort), mode_id: '3' },
+        conversation_mode: 2,
+        conversation_init_option: { project_id: '', need_ack_conversation: true },
+        conversation_init_ext: {
+          // 工作模式必须带这个串，否则上游不按工作台运行（实测网页版就是这段）
+          agent_task_param: JSON.stringify({
+            runtime_type: 1, folder_name: '', device_name: '', workspace: '', local_app_id: '', local_device_id: '',
+          }),
+          model_item_key: modelItemKey,
+          reasoning_effort: String(effort),
+          mode_id: '3',
+        },
         regen_query_id: [], edit_query_id: [], regen_instruction: '', no_replace_for_regen: false,
         message_from: 0, shared_app_name: '', shared_app_id: '',
         sse_recv_event_options: { support_chunk_delta: true }, support_lazy_fetch_stream: true,
         is_ai_playground: false, is_old_user: false, general_task_param: { server_do_compare: true },
         recovery_option: { is_recovery: false, req_create_time_sec: Math.floor(now / 1000), append_sse_event_scene: 0 },
         message_storage_type: 0, related_deleted_message_ids: {}, connector_info_list: [],
-        model_config: { model_item_key: modelItemKey, model_extra_params: {}, reasoning_effort: effort },
+        model_config: {
+          model_item_key: modelItemKey,
+          model_extra_params: m.extraParams && typeof m.extraParams === 'object' ? m.extraParams : {},
+          reasoning_effort: effort,
+        },
         aggregate_params: {},
       },
     };
@@ -737,6 +796,8 @@ export class DoubaoClient {
     let full = '';
     let ended = false;
     let ackConv = '';
+    /** 流内错误（STREAM_ERROR）：循环退出后再抛，避免被单事件解析的 catch 吞掉 */
+    let streamErr = null;
     /** 累加并透出增量，同时写进上层记账对象 */
     const push = (t) => { full += t; sink.text = full; return t; };
     try {
@@ -785,6 +846,28 @@ export class DoubaoClient {
                 const t = b?.content?.text_block?.text;
                 if (typeof t === 'string' && t) yield push(t);
               }
+            } else if (evName === 'STREAM_ERROR') {
+              // 上游在流里报错（最常见的不是"没内容"，而是风控/限流）：
+              //   data: {"error_code":710022004,"error_msg":"rate limited",
+              //          "extra":{"decision":"{\"type\":\"verify\",\"subtype\":\"semantic_reasoning\"...}"}}
+              // 以前这类事件被忽略，最后只剩一句"上游未返回内容"，排查时看不出真因。
+              // 注意：整条解析链外层有一个 catch（单事件解析失败不中断），所以这里不能直接 throw，
+              // 先记下来、置 ended，循环退出后再抛。
+              const d = JSON.parse(dataStr);
+              const code = Number(d?.error_code) || 0;
+              const msg = String(d?.error_msg || d?.message || '').trim();
+              let decision = '';
+              try { decision = typeof d?.extra?.decision === 'string' ? JSON.parse(d.extra.decision)?.type || '' : d?.extra?.decision?.type || ''; } catch { /* 决策串不是 JSON 也照样报错 */ }
+              const verify = /verify/i.test(decision);
+              const brief = `上游流内错误 ${code || ''}${msg ? ` ${msg}` : ''}${verify ? '（触发人机验证）' : ''}`.trim();
+              if (code === 710022004 || /rate ?limit|too many/i.test(msg) || verify) {
+                streamErr = new DoubaoError('ratelimit', `${brief}：豆包要求人机验证或已限流，稍后重试或换号`, 429);
+              } else if (code === 710022001 || /quota|exceed/i.test(msg)) {
+                streamErr = new DoubaoError('quota', brief, 403);
+              } else {
+                streamErr = new DoubaoError('upstream', brief);
+              }
+              ended = true;
             } else if (evName === 'SSE_ACK') {
               // 记录服务端分配的 conversation_id，供下一轮复用上下文
               const d = JSON.parse(dataStr);
@@ -803,6 +886,13 @@ export class DoubaoClient {
       }
     } finally {
       try { await reader.cancel(); } catch (e) { /* ignore */ }
+    }
+
+    // 流里报的错在循环外抛：内层 catch 会吞掉异常，只能先记下来
+    if (streamErr) {
+      // 已经吐过内容的，标记截断；没吐过的直接抛（交给 chat() 换号/冷却）
+      streamErr.partialText = full;
+      throw streamErr;
     }
 
     const ms = Date.now() - startedAt;
@@ -826,11 +916,11 @@ export class DoubaoClient {
     // 记录宿主本轮实际下发的模型名，/doubao/status 与日志据此排查「切换模型没生效」
     this.lastModel = modelId || '';
     this.lastModelAt = Date.now();
-    const modelItemKey = this.resolveModelItemKey(modelId);
-    if (!modelItemKey) {
+    const spec = this.resolveModelSpec(modelId);
+    if (!spec) {
       throw new DoubaoError('upstream', `未知模型 ${modelId || '(空)'}：本插件只接豆包账号，可选模型为 ${this.modelIds().join(', ')}`);
     }
-    this.log('info', `模型映射 ${modelId} -> ${modelItemKey}`);
+    this.log('info', `模型映射 ${modelId} -> ${spec.modelItemKey}（need_deep_think=${spec.itemId}）`);
     const maxAttempts = Math.max(1, this.cfg.maxAttempts ?? 2);
     const tried = new Set();
     let lastErr = null;
@@ -860,7 +950,7 @@ export class DoubaoClient {
       // 每个账号一次记账：流中途失败时据此判断"是否已经吐字"，已吐字就不再换号重发
       const attempt = { text: '', conversationId: '' };
       try {
-        const full = yield* this.chatOnce(acc, modelItemKey, text, signal, opts.conversationId || '', attempt);
+        const full = yield* this.chatOnce(acc, spec, text, signal, opts.conversationId || '', attempt);
         return full;
       } catch (e) {
         if (e instanceof DoubaoError) {
