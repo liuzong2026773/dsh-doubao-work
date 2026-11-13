@@ -39,6 +39,15 @@ window.__ModuleLoader__.load({
       update: (account) => req('/api/doubao/account/update', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(account),
       }),
+      browserLaunch: (opt) => req('/api/doubao/browser/launch', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opt || {}),
+      }),
+      browserGrab: (opt) => req('/api/doubao/browser/grab', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opt || {}),
+      }),
+      browserClose: (opt) => req('/api/doubao/browser/close', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opt || {}),
+      }),
     }
 
     const S = {
@@ -78,6 +87,7 @@ window.__ModuleLoader__.load({
       const [err, setErr] = useState('')
       const [busy, setBusy] = useState('')
       const [log, setLog] = useState('')
+      const [browser, setBrowser] = useState(null) // 从浏览器导入：{port, browser:{name}, hint}
 
       const load = useCallback(async () => {
         try {
@@ -120,6 +130,35 @@ window.__ModuleLoader__.load({
         setBusy(a.id); try { await api.remove(a.id) } catch (e) {} setBusy(''); load()
       }
 
+      // ---- 从浏览器导入（CDP）：不需要用户自己去 F12 里复制 Cookie ----
+      const onBrowserLaunch = async () => {
+        setBusy('browser'); setLog('正在打开一个独立的浏览器窗口…')
+        try {
+          const r = await api.browserLaunch({})
+          setBrowser(r)
+          setLog(r.hint || ('已打开 ' + ((r.browser && r.browser.name) || '浏览器') + '，调试端口 ' + r.port))
+        } catch (e) { setLog('打开浏览器失败：' + (e.message || e)) }
+        setBusy('')
+      }
+      const onBrowserGrab = async () => {
+        setBusy('grab'); setLog('正在从浏览器读取豆包 Cookie…')
+        try {
+          const r = await api.browserGrab({ port: browser && browser.port })
+          if (!r.ok) {
+            setLog(r.reason || '还没拿到登录态：请先在打开的窗口里登录豆包，再点一次「抓取 Cookie」')
+          } else {
+            setLog('已导入：' + r.describe + '｜豆包 Cookie ' + r.doubaoCookies + ' 个（其中 HttpOnly ' + r.httpOnly + ' 个）'
+              + (r.id ? '｜账号 ' + r.id : '')
+              + (r.warnings && r.warnings.length ? '\n注意：\n- ' + r.warnings.join('\n- ') : ''))
+          }
+        } catch (e) { setLog('抓取失败：' + (e.message || e)) }
+        setBusy(''); load()
+      }
+      const onBrowserClose = async () => {
+        try { await api.browserClose({ port: browser && browser.port }) } catch (e) {}
+        setBrowser(null); setLog('已关闭导入用的浏览器窗口（临时配置已清理）')
+      }
+
       if (err) return h('div', { style: S.wrap }, h('div', { style: { color: '#c0392b' } }, '读取失败：' + err),
         h('div', { style: S.mute }, '请确认插件已重启（状态接口 /doubao/status 由宿主进程提供）。'))
 
@@ -142,7 +181,16 @@ window.__ModuleLoader__.load({
         h('div', { style: S.row },
           h('button', { style: S.btn, onClick: load, disabled: !!busy }, '刷新'),
           h('button', { style: S.btn, onClick: onCheck, disabled: !!busy }, busy === 'check' ? '检查中…' : '全部健康检查'),
-          h('button', { style: S.btn, onClick: () => (showAdd ? setShowAdd(false) : openAdd()) }, showAdd ? '收起' : '添加账号')),
+          h('button', { style: S.btn, onClick: () => (showAdd ? setShowAdd(false) : openAdd()) }, showAdd ? '收起' : '添加账号'),
+          h('button', { style: S.btn, onClick: onBrowserLaunch, disabled: !!busy }, busy === 'browser' ? '打开中…' : '从浏览器导入')),
+
+        browser ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderRadius: 10, border: '1px solid var(--dsw-alias-border-l2, #e3e6ea)' } },
+          h('div', { style: S.mute },
+            '导入窗口已打开：' + ((browser.browser && browser.browser.name) || '浏览器') + '，调试端口 127.0.0.1:' + browser.port
+            + '。这是插件专用的临时配置（不碰你日常的浏览器数据），请在里面登录豆包，然后点「抓取 Cookie」。'),
+          h('div', { style: S.row },
+            h('button', { style: S.btn, onClick: onBrowserGrab, disabled: !!busy }, busy === 'grab' ? '抓取中…' : '抓取 Cookie（并入库）'),
+            h('button', { style: S.btn, onClick: onBrowserClose, disabled: !!busy }, '关闭窗口'))) : null,
 
         showAdd ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderRadius: 10, border: '1px solid var(--dsw-alias-border-l2, #e3e6ea)' } },
           h('div', { style: S.mute }, formMode === 'update'
@@ -169,7 +217,8 @@ window.__ModuleLoader__.load({
               .map(c => h('th', { key: c, style: S.th }, c)))),
           h('tbody', null, accounts.length === 0
             ? h('tr', null, h('td', { style: S.td, colSpan: 7 }, h('span', { style: S.mute },
-              '还没有账号：点上面「添加账号」粘贴 Cookie 即可（整段 Cookie、`Cookie:` 请求头、浏览器「Copy as cURL」、扩展导出的 JSON 都能识别），保存后立即生效。'
+              '还没有账号：点「从浏览器导入」自动抓取（插件会开一个临时浏览器窗口，你在里面登录豆包即可，不碰你日常浏览器的数据），'
+              + '或点「添加账号」粘贴 Cookie（整段 Cookie、`Cookie:` 请求头、Copy as cURL、扩展导出的 JSON 都能识别）。'
               + (data.accountsPath ? ' 也可直接编辑账号文件 ' + data.accountsPath + '（改完保存即生效，不用重启）。' : ''))))
             : accounts.map(a => h('tr', { key: a.id },
               h('td', { style: S.td }, a.remark || a.id),

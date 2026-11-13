@@ -43,13 +43,17 @@ const ctx = {
 console.log('加载与注册');
 ok('apply 不抛异常', () => mod.apply(ctx, { providerId: 'doubao-work', providerName: '测试', accounts: [], dataDir: DATA_DIR }));
 ok('注册了 provider', () => assert.deepEqual(adapterProviders, ['doubao-work']));
-ok('注册了预期路由集合（8 精确 + 1 /api 前缀）', () => {
+ok('注册了预期路由集合（12 精确 + 1 /api 前缀）', () => {
   assert.deepEqual(Object.keys(routes).sort(), [
     '/api/doubao',
     '/doubao/account/add',
     '/doubao/account/enable',
     '/doubao/account/remove',
     '/doubao/account/update',
+    '/doubao/browser/browsers',
+    '/doubao/browser/close',
+    '/doubao/browser/grab',
+    '/doubao/browser/launch',
     '/doubao/check',
     '/doubao/checkin',
     '/doubao/checkin/status',
@@ -556,5 +560,155 @@ ok('status 暴露数据目录与账号文件路径（面板空态要用）', () 
   assert.equal(path.resolve(stPath.dataDir), path.resolve(DATA_DIR));
   assert.ok(String(stPath.accountsPath).endsWith('accounts.json'), stPath.accountsPath);
 });
+
+// ---------------- 1.3.0：从浏览器导入（CDP） ----------------
+console.log('从浏览器导入（CDP）');
+const browserMod = await import('../browser.js');
+const http = await import('node:http');
+
+// 假 CDP 服务：只实现 /json/version（探测端口用），WebSocket 用注入的假 socket
+let fakeCookies = [];
+let wsSendSeen = [];
+const cdp = http.createServer((req, res) => {
+  if (req.url.startsWith('/json/version')) {
+    res.writeHead(200, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ Browser: 'FakeEdge/999', webSocketDebuggerUrl: `ws://127.0.0.1:${cdp.address().port}/devtools/browser/fake` }));
+    return;
+  }
+  res.writeHead(404); res.end('{}');
+});
+await new Promise(r => cdp.listen(0, '127.0.0.1', r));
+const cdpPort = cdp.address().port;
+
+function fakeSocket() {
+  const listeners = {};
+  return {
+    addEventListener: (t, fn) => {
+      (listeners[t] = listeners[t] || []).push(fn);
+      // 真实 WebSocket 连上后才派发 open；假实现必须补这一拍，否则调用方永远不发指令
+      if (t === 'open') queueMicrotask(() => fn());
+    },
+    send: (raw) => {
+      const msg = JSON.parse(raw);
+      wsSendSeen.push(msg);
+      // 下一拍回消息，模拟真实 CDP 的异步应答
+      queueMicrotask(() => (listeners.message || []).forEach(fn => fn({ data: JSON.stringify({ id: msg.id, result: { cookies: fakeCookies } }) })));
+    },
+    close: () => {},
+  };
+}
+
+const fakeSpawnCalls = [];
+browserMod.injectable.existsSync = (p) => /msedge\.exe$/.test(p);
+browserMod.injectable.findFreePort = async () => cdpPort;
+browserMod.injectable.spawnImpl = (cmd, args) => { fakeSpawnCalls.push({ cmd, args }); return { pid: 999999, unref() {} }; };
+browserMod.injectable.killImpl = async (pid) => { fakeSpawnCalls.push({ killed: pid }); };
+browserMod.injectable.createSocket = () => fakeSocket();
+
+const dupCookies = [
+  { name: 'sessionid', value: 'aaaabbbbccccdddd', domain: '.doubao.com', path: '/', httpOnly: true },
+  { name: 'sid_guard', value: 'eeeeffff00001111', domain: '.doubao.com', path: '/', httpOnly: true },
+  { name: 'ttwid', value: 'shared', domain: '.doubao.com', path: '/', httpOnly: false },
+  { name: 'ttwid', value: 'path-specific', domain: '.doubao.com', path: '/alice', httpOnly: false },
+  { name: 's_v_web_id', value: 'notours', domain: '.example.com', path: '/', httpOnly: false },
+];
+const header = browserMod.cookiesToHeader(dupCookies);
+ok('cookiesToHeader：只留豆包域、同名去重、按 path 长度排序', () => {
+  assert.equal(header.keys.includes('s_v_web_id'), false, '别的域不该进来');
+  assert.equal(header.keys.filter(k => k === 'ttwid').length, 1, '同名只留一个');
+  assert.match(header.cookie, /ttwid=path-specific/, 'path 更具体的应胜出');
+  assert.deepEqual(header.httpOnly.sort(), ['sessionid', 'sid_guard']);
+});
+
+const browsers = await call('/doubao/browser/browsers', {});
+ok('browser/browsers 探测到可用浏览器', () => {
+  assert.equal(browsers.code, 200);
+  const b = JSON.parse(browsers.body);
+  assert.equal(b.browsers.length, 1);
+  assert.equal(b.browsers[0].id, 'edge');
+});
+
+const launch = await call('/doubao/browser/launch', {});
+const launchJson = JSON.parse(launch.body);
+ok('browser/launch 用独立临时 profile + 调试端口（不碰日常浏览器）', () => {
+  assert.equal(launch.code, 200);
+  assert.equal(launchJson.port, cdpPort);
+  const args = fakeSpawnCalls[0].args.join(' ');
+  assert.match(args, new RegExp(`--remote-debugging-port=${cdpPort}`));
+  assert.match(args, /--user-data-dir=/);
+  assert.match(args, /dsh-doubao-cdp-/, '必须是独立 user-data-dir（Chrome 136+ 才对默认目录禁用调试端口）');
+  assert.match(args, /doubao\.com/);
+});
+
+fakeCookies = dupCookies;
+const grab = await call('/doubao/browser/grab', { port: cdpPort });
+const grabJson = JSON.parse(grab.body);
+ok('browser/grab 抓到登录态并入库', () => {
+  assert.equal(grab.code, 200, grab.body);
+  assert.equal(grabJson.ok, true);
+  assert.equal(grabJson.httpOnly, 2, 'HttpOnly 的 sessionid/sid_guard 必须抓到');
+  assert.ok(grabJson.id, '应自动创建账号');
+  const stored = JSON.parse(fs.readFileSync(ACCOUNTS_JSON, 'utf8')).accounts.find(a => a.id === grabJson.id);
+  assert.match(stored.cookie, /sessionid=aaaabbbbccccdddd/);
+  assert.ok(!/s_v_web_id/.test(stored.cookie), '别的域不能入库');
+  assert.deepEqual(wsSendSeen.map(m => m.method), ['Storage.getCookies'], '只发只读指令');
+});
+
+const grabAgain = await call('/doubao/browser/grab', { port: cdpPort });
+ok('同一 Cookie 再抓一次不会重复建号', () => {
+  const b = JSON.parse(grabAgain.body);
+  assert.equal(b.ok, true);
+  assert.equal(b.id, grabJson.id);
+  assert.equal(b.existing, true);
+});
+
+fakeCookies = [{ name: 'ttwid', value: 'x', domain: '.doubao.com', path: '/' }];
+const grabNoLogin = await call('/doubao/browser/grab', { port: cdpPort });
+ok('没登录时明确告诉用户去登录，而不是塞个坏账号', () => {
+  const b = JSON.parse(grabNoLogin.body);
+  assert.equal(b.ok, false);
+  assert.equal(b.stage, 'login');
+  assert.match(b.reason, /sessionid/);
+});
+
+const grabNoPort = await call('/doubao/browser/grab', { port: 1 });
+ok('端口没开时说明原因（而不是 500 堆栈）', () => {
+  const b = JSON.parse(grabNoPort.body);
+  assert.equal(b.ok, false);
+  assert.equal(b.stage, 'probe');
+});
+
+await assert.rejects(
+  () => browserMod.grabAllCookies('ws://10.0.0.5:9222/devtools/browser/x', { createSocket: () => fakeSocket() }),
+  /拒绝连接非本机/,
+);
+ok('拒绝连接非本机调试端口（防止把 Cookie 发到局域网/公网）', () => {});
+
+const launched = JSON.parse(launch.body);
+fs.mkdirSync(launched.profileDir, { recursive: true });
+const closed = await call('/doubao/browser/close', {});
+ok('browser/close 关进程并清理临时 profile', () => {
+  const b = JSON.parse(closed.body);
+  assert.equal(b.ok, true);
+  assert.equal(fs.existsSync(launched.profileDir), false, '临时 profile 应被删除');
+  assert.ok(fakeSpawnCalls.some(c => c.killed === 999999), '应结束拉起的进程');
+});
+
+const osMod = await import('node:os');
+const staleDir = path.join(osMod.tmpdir(), 'dsh-doubao-cdp-sweeptest');
+const freshDir = path.join(osMod.tmpdir(), 'dsh-doubao-cdp-sweeptest-fresh');
+fs.mkdirSync(staleDir, { recursive: true });
+fs.mkdirSync(freshDir, { recursive: true });
+const past = new Date(Date.now() - 7 * 3600 * 1000);
+fs.utimesSync(staleDir, past, past);
+browserMod.sweepStaleProfiles(osMod.tmpdir());
+ok('launch 前清掉 6 小时前的残留临时 profile（不动新开的）', () => {
+  assert.equal(fs.existsSync(staleDir), false, '过期目录应清掉');
+  assert.equal(fs.existsSync(freshDir), true, '新目录不能动');
+});
+fs.rmSync(freshDir, { recursive: true, force: true });
+
+cdp.close();
+for (const k of Object.keys(browserMod.injectable)) browserMod.injectable[k] = null;
 
 console.log('\n全部通过：' + passed + ' 项');

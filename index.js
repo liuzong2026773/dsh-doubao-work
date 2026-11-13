@@ -11,6 +11,7 @@
 import { Schema, LlmAdapter, LlmError, resolvedFrom } from './host.js';
 import { dataPaths } from './paths.js';
 import { parseCookieInput, describeParse } from './cookie-input.js';
+import { candidateBrowsers, launchBrowser, grabDoubao, closeBrowser } from './browser.js';
 import { DoubaoClient, DoubaoError, BUILTIN_MODELS, conversationKey } from './doubao.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -62,6 +63,7 @@ export const Config = Schema && Schema.object({
   dailyQuota: Schema.number().description('单账号每日额度估算基数（周一翻倍，仅用于面板推算，非官方数字）').min(1).default(200),
   adminToken: Schema.string().description('跨机管理令牌：仅在非本机访问管理接口时需要，留空则只允许本机调用').default(''),
   dataDir: Schema.string().description('Cookie 与用量状态的存放目录（留空用 <dshHome>/doubao-work；不要放插件目录，升级会被覆盖）').default(''),
+  browserPath: Schema.string().description('「从浏览器导入」用的浏览器可执行文件路径（留空自动探测 Edge/Chrome/Chromium）').default(''),
   upstream: Schema.object({
     aid: Schema.string().description('应用 ID').default('497858'),
     device_id: Schema.string().description('设备 ID').default('7707509248230065699'),
@@ -77,7 +79,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.2.6';
+export const VERSION = '1.3.0';
 
 /**
  * 配置默认值。
@@ -106,6 +108,7 @@ export const DEFAULTS = {
   dailyQuota: 200,
   adminToken: '',
   dataDir: '',
+  browserPath: '',
   upstream: {
     aid: '497858',
     device_id: '7707509248230065699',
@@ -359,6 +362,8 @@ export function apply(ctx, rawConfig) {
   // POST /doubao/check   → 逐个账号做健康检查
   let statusRoutesRegistered = false;
   let statusRouteDisposers = [];
+  /** 「从浏览器导入」拉起的浏览器窗口句柄（pid / 调试端口 / 临时 profile），同一次 apply 内复用 */
+  let browserHandle = null;
 
   /**
    * 拿到 webServer 才注册；重复调用安全。
@@ -561,6 +566,132 @@ export function apply(ctx, rawConfig) {
           const st = client.accountState ? client.accountState(body.id) : null;
           if (st) { st.authError = false; st.lastError = ''; st.coolUntil = 0; }
           json(res, 200, { ok: true, id: a.id, parse: parsed ? { format: parsed.format, pairs: parsed.pairs, describe: describeParse(parsed), warnings: parsed.warnings } : null });
+        },
+      });
+
+      // ---------------- 从浏览器导入（CDP） ----------------
+      // 为什么不读浏览器 Cookie 库：Chrome/Edge 127+ 的 App-Bound Encryption 让第三方解不开，
+      // macOS 要 Keychain、Linux 要 Secret Service，各内核路径还不一样。CDP 走浏览器自己的
+      // 调试端口，跨平台、跨内核，且拿得到 HttpOnly 的 sessionid/sid_guard。
+
+      /** 抓到的 Cookie 入库：给了 id 就更新（没有则新建），没给 id 时按 Cookie 去重 */
+      const saveAccountCookie = (cookie, { id, remark } = {}) => {
+        const list = readAccountsFile();
+        if (id) {
+          let a = list.find(x => x.id === id);
+          let created = false;
+          if (!a) {
+            const known = client.allAccounts().find(x => x.id === id);
+            a = known
+              ? { id: known.id, remark: known.remark || '', cookie: known.cookie, enabled: known.enabled !== false }
+              : { id, remark: (remark || '').trim().slice(0, 64), cookie, enabled: true };
+            list.push(a);
+            created = true;
+          }
+          a.cookie = cookie;
+          if (typeof remark === 'string' && remark.trim()) a.remark = remark.trim().slice(0, 64);
+          a.enabled = true;
+          writeAccountsFile(list);
+          return { id: a.id, created };
+        }
+        const same = list.find(x => x.cookie === cookie);
+        if (same) return { id: same.id, existing: true };
+        let n = list.length + 1;
+        while (list.some(a => a.id === `acc-${n}`)) n++;
+        const newId = `acc-${n}`;
+        list.push({ id: newId, remark: (remark || '').trim().slice(0, 64), cookie, enabled: true });
+        writeAccountsFile(list);
+        return { id: newId, created: true };
+      };
+
+      register({
+        kind: 'exact',
+        path: '/doubao/browser/browsers',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const list = candidateBrowsers();
+          json(res, 200, { browsers: list.map(b => ({ id: b.id, name: b.name, path: b.path })), configured: String(config.browserPath || '') });
+        },
+      });
+
+      register({
+        kind: 'exact',
+        path: '/doubao/browser/launch',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = (await parseBody(req)) || {};
+          try {
+            // 已经拉起过就先复用：重复点「从浏览器导入」不该开一堆窗口
+            if (browserHandle && browserHandle.port) {
+              const alive = await grabDoubao({ port: browserHandle.port }).then(r => r.stage !== 'probe').catch(() => false);
+              if (alive) return json(res, 200, { ok: true, reused: true, ...browserHandle });
+            }
+            browserHandle = await launchBrowser({
+              browserId: typeof body.browserId === 'string' ? body.browserId : '',
+              browserPath: String(body.browserPath || config.browserPath || ''),
+              port: Number(body.port) || 0,
+              startUrl: typeof body.startUrl === 'string' && body.startUrl ? body.startUrl : undefined,
+            });
+            json(res, 200, {
+              ok: true,
+              ...browserHandle,
+              hint: '已打开一个独立的浏览器窗口（临时配置，不影响你日常浏览）。请在里面登录豆包，登录完成后点「抓取 Cookie」。',
+            });
+          } catch (e) {
+            json(res, 500, { ok: false, error: String(e.message || e) });
+          }
+        },
+      });
+
+      register({
+        kind: 'exact',
+        path: '/doubao/browser/grab',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = (await parseBody(req)) || {};
+          const port = Number(body.port) || (browserHandle && browserHandle.port) || 9222;
+          try {
+            const r = await grabDoubao({ port });
+            if (!r.ok) return json(res, 200, { ok: false, stage: r.stage, reason: r.reason, doubaoCookies: r.doubaoCookies ?? 0, keys: r.keys || [] });
+            const parsed = parseCookieInput(r.cookie);
+            const out = {
+              ok: true,
+              stage: 'done',
+              browser: r.browser,
+              doubaoCookies: r.doubaoCookies,
+              httpOnly: r.httpOnly.length,
+              keys: r.keys,
+              describe: describeParse(parsed),
+              warnings: parsed.warnings,
+            };
+            // save 缺省为 true：面板点一次就应该入库；工具/路由只要 Cookie 时传 save:false
+            if (body.save !== false) {
+              const id = typeof body.id === 'string' ? body.id.trim() : '';
+              if (id && !ID_RE.test(id)) return json(res, 400, { ok: false, error: 'id 只能包含字母数字下划线点和中文，最长 64' });
+              const saved = saveAccountCookie(parsed.cookie, { id, remark: typeof body.remark === 'string' ? body.remark : '' });
+              out.id = saved.id;
+              out.created = !!saved.created;
+              out.existing = !!saved.existing;
+            }
+            json(res, 200, out);
+          } catch (e) {
+            json(res, 500, { ok: false, error: String(e.message || e) });
+          }
+        },
+      });
+
+      register({
+        kind: 'exact',
+        path: '/doubao/browser/close',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          try {
+            const r = await closeBrowser(browserHandle || {});
+            browserHandle = null;
+            json(res, 200, r);
+          } catch (e) {
+            json(res, 500, { ok: false, error: String(e.message || e) });
+          }
         },
       });
 

@@ -46,18 +46,53 @@
 
 ## 获取 Cookie
 
-1. 电脑浏览器打开 [www.doubao.com](https://www.doubao.com) 并登录
-2. `F12` → Network → 随便点一个请求 → Request Headers → 复制整条 `Cookie` 值
-3. 粘到设置页「添加账号」的框里（或插件配置 `accounts[0].cookie`）
+**方式 A：设置页「从浏览器导入」（推荐，1.3.0 起，全程不用碰 F12）**
 
-> 1.2.6 起粘贴框会**自动识别形状**，不用自己剪裁：整段 Cookie、`Cookie: …` 请求头、
-> 整个 Request Headers 面板、浏览器右键「Copy as cURL」的整条命令、EditThisCookie /
-> Cookie-Editor 导出的 JSON、Netscape `cookies.txt` 都能直接贴。识别结果会回显
-> （「识别为『cURL 命令』，提取 14 个字段」），缺登录态字段时会提示。
+1. 设置 → 模型接入 → 豆包工作 → 点「从浏览器导入」
+2. 插件会开一个**独立临时配置**的浏览器窗口（Edge/Chrome/Chromium 自动探测），你在里面正常登录豆包
+3. 回到面板点「抓取 Cookie（并入库）」，账号立刻出现在列表里
+
+**方式 B：粘贴（1.2.6 起自动识别形状）**
+
+1. 电脑浏览器打开 [www.doubao.com](https://www.doubao.com) 并登录
+2. `F12` → Network → 随便点一个请求 → Request Headers → 复制
+3. 粘到「添加账号」的框里（或插件配置 `accounts[0].cookie`）
+
+粘贴框不用自己剪裁：整段 Cookie、`Cookie: …` 请求头、整个 Request Headers 面板、
+浏览器右键「Copy as cURL」的整条命令、EditThisCookie / Cookie-Editor 导出的 JSON、
+Netscape `cookies.txt` 都能直接贴，识别结果会回显（「识别为『cURL 命令』，提取 14 个字段」），
+缺登录态字段时会提示。命令行同样支持：`node tools/accounts.mjs add --cookie-file cURL.txt`。
+
+## 从浏览器导入是怎么做的（以及为什么不是"读浏览器 Cookie 库"）
+
+走 **CDP（Chrome DevTools 协议）**：`--remote-debugging-port` + 独立 `--user-data-dir` 拉起浏览器，
+连 `ws://127.0.0.1:<port>/devtools/browser/...`，发一条 `Storage.getCookies` 只读指令，
+过滤 `.doubao.com` 域后拼成 Cookie 串入库。
+
+为什么不做成"直接读浏览器 Cookie 库"（很多同类工具的做法）：
+
+- Chrome/Edge **127+** 在 Windows 上给 Cookie 的 AES key 加了 **App-Bound Encryption**，第三方进程解不开；
+  社区库（`browser_cookie3` / `rookie` 一类）因此大面积失效，而且随浏览器版本反复变化。
+- macOS 要 Keychain 授权弹窗并受签名/权限影响，Linux 要 Secret Service（headless 拿不到），
+  360 / 夸克 / 千问这些国产内核路径与加密各不相同。
+- 浏览器开着时 Cookie 库被占用（实测 `EBUSY`），要靠影子副本绕。
+- 网页里跑 JS 读 `document.cookie` 拿不到 **HttpOnly** 的 `sessionid` / `sid_guard`——这正是登录态所在。
+
+CDP 一条路把这四个问题全绕开，且对 Chromium 内核通用。代价是需要开一个专用窗口（本插件用临时
+profile，不碰你日常浏览器的数据）。**手机版 DSH 不适用**：插件代码跑在桌面宿主上，读不到手机浏览器的
+登录态，手机请用「粘贴」或把桌面导出的 `accounts.json` 同步过去。
+
+安全边界（写死在 `browser.js`，不是配置项）：只连 `127.0.0.1`、只发 `Storage.getCookies` 这一条
+只读指令、只取豆包域、日志与接口返回都不带 Cookie 本体（只报字段数与名字）。
+
+探测顺序是 Edge → Chrome → Chromium（Windows 上连 `EdgeCore\<版本>\msedge.exe` 这种没有
+Application 包装层的布局也认）。想用别的内核浏览器，在插件配置里填 `browserPath` 指向可执行文件即可。
+命令行版：`node tools/browser-import.mjs --wait 300`（`--attach --port 9222` 可连你自己开着的调试端口）。
 
 ## 功能
 
 - **多账号池**：轮询/随机调度，Cookie 填多个即可
+- **从浏览器一键导入**（1.3.0）：CDP 抓取，跨 Chromium 内核、拿得到 HttpOnly 登录态、不读浏览器隐私库
 - **冷却分级**：429/403 长冷却 24h（对应“第二天恢复”）、5xx 空响应 短冷却 5 分钟、Cookie 失效单独标记
 - **单账号 RPM 限速**（默认 6/分钟，可配），防止高频触发风控
 - **失败自动换号重试**；**流中断保护**：已经吐出内容后不再换号重发，避免用户看到重复文本
@@ -120,6 +155,7 @@ dsh-doubao-work/
 ├── host.js            # 宿主包解析：从安装目录取 @deepseek-ai/*（profile 安装的关键）
 ├── paths.js           # 数据目录：Cookie/状态放 <dshHome>/doubao-work，升级不丢
 ├── cookie-input.js    # 粘贴解析：整段 Cookie / 请求头 / cURL / JSON / cookies.txt → 规范串
+├── browser.js         # 从浏览器导入：探测内核、拉起调试端口、CDP 只读抓 Cookie
 ├── client.js          # 浏览器半身：设置页「豆包工作」
 ├── package.json
 ├── cordis.patch.yml
@@ -137,7 +173,8 @@ dsh-doubao-work/
 插件带浏览器半身（`client.js`），重启 DSH 后会在 **设置 → 模型接入** 里多出一页「豆包工作」，
 直接显示账号池、今日用量、预估剩余额度，并支持健康检查 / 启用停用 / 删除账号。
 
-页面上还能「添加账号」（直接粘贴整段 Cookie，保存即生效）、「停用/启用」、「换 Cookie」与「删除」。
+页面上还能「添加账号」（直接粘贴整段 Cookie，保存即生效）、「停用/启用」、「换 Cookie」与「删除」，
+1.3.0 起多了「从浏览器导入」：点开临时浏览器窗口 → 在里面登录豆包 → 点「抓取 Cookie（并入库）」。
 停用的账号仍然显示在列表里（状态显示「已停用」），所以随时可以点回来启用。
 「添加账号 / 换 Cookie」的粘贴框会自动识别六种粘贴形状并回显识别结果（见上文「获取 Cookie」），
 空态文案与页脚会直接显示当前账号文件路径（数据目录可能被 `dataDir` 改过，写死路径会误导）。
@@ -145,7 +182,7 @@ dsh-doubao-work/
 离线自检（不重启、不联网、不耗额度）：
 
 ```bash
-node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/签到/数据目录/错误码/复用规划/流协议，共 84 项
+node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/浏览器导入(CDP)/签到/数据目录/错误码/复用规划/流协议，共 94 项
 node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到，共 17 项
 ELECTRON_RUN_AS_NODE=1 DSH_HOST_MODULES="<安装目录>/app.asar/dsh/node_modules" \
   "<安装目录>/DeepSeek Harness.exe" tests/profile-install.mjs   # 模拟 profile 安装，6 项
@@ -205,6 +242,12 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
   （`{format, pairs, describe, warnings}`），失败时返回 400 + `format` + `warnings` 说明为什么没解析出来
 - `POST /doubao/checkin` — 全部账号（或 `{"id":"acc-1"}` 单号）每日签到，返回 ok/already/skipped/failed 汇总
 - `POST /doubao/checkin/status` — 单账号今日签到状态（`{"id":"acc-1"}`）
+- `POST /doubao/browser/browsers` — 探测到的可用浏览器（`{browsers:[{id,name,path}], configured}`）
+- `POST /doubao/browser/launch` — 拉起带调试端口的临时浏览器窗口（`{browserId?, browserPath?, port?, startUrl?}`），
+  返回 `{port, pid, profileDir, browser, hint}`；已活着则复用同一个窗口（`reused: true`）
+- `POST /doubao/browser/grab` — 抓取并入库（`{port?, id?, remark?, save?}`，`save:false` 只回结果不写文件）；
+  成功返回 `{ok:true, describe, doubaoCookies, httpOnly, keys, id}`，没登录返回 `{ok:false, stage:'login', reason}`
+- `POST /doubao/browser/close` — 结束拉起的浏览器进程并清理临时 profile
 
 **访问控制**：带 `Origin` 的浏览器请求必须同源；不带 `Origin` 的调用只放行本机（`127.0.0.1` / `::1`）。
 需要从别的机器调管理接口时，在配置里设 `adminToken`，并带上请求头：
@@ -259,18 +302,51 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 
 ## 待办 / 已知缺口
 
+- **手机端一键导入做不了**（不是偷懒）：插件代码跑在桌面宿主上，读不到手机浏览器的登录态——
+  iOS 沙箱不允许访问别的 App 的文件，Android 非 root 也一样。手机现实可用的路子是
+  「桌面 `tools/browser-import.mjs` 抓完 → 把 `accounts.json` 传到手机的数据目录」或直接粘贴。
+- **读浏览器 Cookie 库**（Chrome/Edge 的 sqlite + DPAPI/ABE）没有做，也不建议做：Chrome/Edge 127+ 的
+  App-Bound Encryption 让第三方进程解不开，macOS/Linux 又各有 Keychain/Secret Service 门槛，
+  国产内核路径不一。CDP 一条路把这些全绕开了，见上文「从浏览器导入是怎么做的」。
 - `standalone/` 独立网关是**同逻辑的另一份实现**，1.2.2 已同步流中断保护（截断时 `finish_reason: length`
-  并记 warn），但**仍不支持 function calling**。后续应改为直接复用 `doubao.js`，避免两处漂移。
+  并记 warn），但**仍不支持 function calling**，也没有接浏览器导入。后续应改为直接复用 `doubao.js`，避免两处漂移。
 - 8 个未抓 `model_item_key`（豆包 2.1 Pro / Kimi K3 / GLM 5.3 等），抓到即可加进 `extraModels`。
 - 签到接口 1.2.3 已抓到并接入（`/alice/ug/campaign/v3/detail/` 查状态 + `/alice/ug/campaign/landing/checkin` 执行，
   详见 docs 与 `/doubao/checkin`）。待办：面板上的「一键签到」按钮接线，以及把每日签到做成定时任务。
-- **一键从本机浏览器导入 Cookie**（Chrome/Edge + DPAPI）还没做：读浏览器 Cookie 库属于读取用户隐私数据，
-  需要用户明确同意后再实现；另外 Chrome 127+ 的 App-Bound 加密会让 DPAPI 解不开，得按版本降级处理。
-  现状是「复制粘贴」，1.2.6 已把粘贴这一步做到能直接吃 cURL / 请求头 / JSON / cookies.txt。
-- 扫码 / 短信登录仍不可行：登录页走 `accounts.doubao.com` 的 webmssdk 风控签名，纯后端模拟注册接口
-  只会得到 `非法应用(22)`；真扫码需要 Electron 内嵌窗口读登录后 Cookie，而 DSH 插件 API 目前不暴露窗口能力。
+- 扫码 / 短信登录仍不可行：登录页走 `accounts.doubao.com` 的 webmssdk 风控签名，纯后端模拟只会得到
+  `非法应用(22)`；真扫码需要宿主开内嵌窗口（WebContents，登录后从那个 session 读 Cookie），
+  DSH 插件 API 目前不暴露窗口能力——这条得向宿主提需求。
 
 ## 更新记录
+
+- **1.3.0**（2026-11-13，加「从浏览器导入」）：
+  - **新增 `browser.js`**：CDP（Chrome DevTools 协议）抓取豆包 Cookie。探测本机 Chromium 内核浏览器
+    （Edge → Chrome → Chromium，含 Windows 上 `EdgeCore\<版本>\msedge.exe` 这种布局），用
+    `--remote-debugging-port=<随机端口>` + **独立临时 `--user-data-dir`** 拉起窗口（Chrome 136 起默认配置目录
+    上的调试端口会被静默忽略，所以必须独立目录，同时也避免碰用户日常数据），登录完成后走 browser 端
+    WebSocket 的 `Storage.getCookies` 取 Cookie，按 `.doubao.com` 域过滤、同域名按 path 长度择优，
+    拼成规范串直接入库——HttpOnly 的 `sessionid` / `sid_guard` 也能拿到。
+  - **不做成"读浏览器 Cookie 库"**：Chrome/Edge 127+ 的 App-Bound Encryption、macOS Keychain、
+    Linux Secret Service、国产内核差异、库被占用时 `EBUSY`，任一都能让方案失效或误报「Cookie 无效」。
+    这条路明确放弃并在 README 里写清理由，省得后来人重踩。
+  - **安全边界写死**：只连 `127.0.0.1`（`grabAllCookies` 直接拒绝非本机 ws 地址）、只发 `Storage.getCookies`
+    一条只读指令、只取豆包域；接口与日志不返回也不打印 Cookie 本体；临时 profile 在 `/doubao/browser/close`
+    时删除。
+  - **新增接口**：`/doubao/browser/browsers|launch|grab|close`（沿用同源/回环守卫与 `adminToken` 机制）。
+    `grab` 默认入库（`save:false` 只取不写），同一份 Cookie 再抓不会重复建号；没登录时返回 `stage:'login'`
+    和可读原因，而不是塞个坏账号进去。
+  - **设置页**：工具栏加「从浏览器导入」，打开后显示临时窗口信息与「抓取 Cookie（并入库）」「关闭窗口」。
+  - **新增 `tools/browser-import.mjs`**：命令行版（`--browser` / `--port` / `--attach` / `--wait` / `--no-save` /
+    `--id` / `--remark`），适合无面板环境与排障。
+  - **测试**：smoke 增至 94 项（CDP 10 项走假 CDP 服务 + 假 WebSocket + 假 spawn，不真开浏览器），
+    并断言 spawn 参数必须带独立 `user-data-dir`、只发 `Storage.getCookies`、拒绝非本机端口。
+  - **零依赖 WebSocket 兜底**：仓库声明 `engines: node>=20`，但普通 Node 20 没有全局 `WebSocket`，
+    所以 `browser.js` 里带了一个只够 CDP 用的最小客户端（文本帧 + 掩码 + close/ping，不处理压缩分片）；
+    运行时有全局 `WebSocket`（Electron 44 / Node 22+）就优先用运行时的。本机已实测：
+    `node tools/browser-import.mjs --no-save` 在 Node 20 下真实拉起 EdgeCore 并读到豆包 Cookie
+    （未登录时 11 个，登录后即可入库），结束后窗口自动关闭。
+  - **残留清理**：`launch` 前清掉 6 小时前的 `dsh-doubao-cdp-*` 临时 profile（只认自家前缀，
+    不动还开着的窗口）。
 
 - **1.2.6**（2026-11-13，粘贴这一步做顺）：
   - **粘贴框不再只认「整段 Cookie」**：新增 `cookie-input.js`，把六种常见粘贴形状统一解析成规范串——
