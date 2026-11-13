@@ -25,15 +25,15 @@ window.__ModuleLoader__.load({
     }
 
     const api = {
-      status: () => req('/doubao/status', { cache: 'no-store' }),
-      check: () => req('/doubao/check', { method: 'POST' }),
-      enable: (id, enabled) => req('/doubao/account/enable', {
+      status: () => req('/api/doubao/status', { cache: 'no-store' }),
+      check: () => req('/api/doubao/check', { method: 'POST' }),
+      enable: (id, enabled) => req('/api/doubao/account/enable', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, enabled }),
       }),
-      remove: id => req('/doubao/account/remove', {
+      remove: id => req('/api/doubao/account/remove', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
       }),
-      add: (account) => req('/doubao/account/add', {
+      add: (account) => req('/api/doubao/account/add', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(account),
       }),
     }
