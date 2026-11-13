@@ -19,8 +19,25 @@ import path from 'node:path';
 const BOT_ID = '7338286299411103781';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
 
+// 豆包 PC 端每日签到活动 scene（即接口里的 campaign_group_code），客户端固定值
+const CHECKIN_SCENE = 'pc_incentive_task_mvp_v3';
 const uuid = () => crypto.randomUUID();
 const shortHash = (s) => crypto.createHash('sha1').update(String(s || '')).digest('hex').slice(0, 16);
+
+/**
+ * 会话复用键。此前只取首条消息前 200 字，两个不同会话只要开头相同（例如都以
+ * "帮我看下这段代码"起头）就会共用同一条上游会话，回答直接串号。
+ * 这里用「全文长度 + 全文 SHA1 前 16 位」，同一会话仍稳定命中，不同会话基本不可能撞。
+ * 局限：宿主未暴露 session id，只能靠内容指纹识别；首条消息完全相同的会话仍会被视为同一条
+ * （那种情况下两者本就无法从内容上区分）。
+ */
+export const conversationKey = (model, firstText) => {
+  const t = String(firstText || '');
+  // 键里刻意不拼 model：豆包会话本身与模型无关，带上 model 会导致「换个模型→键变了→上下文断链」。
+  // 区分不同会话已由首条消息指纹 + 上一条回复指纹双重校验保证，不需要 model 参与。
+  void model;
+  return t ? `${t.length}|${shortHash(t)}` : '';
+};
 
 // ---- 额度按「北京时间自然日」结算 ----
 const CN_OFFSET = 8 * 3600 * 1000;
@@ -282,6 +299,8 @@ export class DoubaoClient {
         totalReq: st.totalReq || 0, totalChars: st.totalChars || 0,
         todayReq, todayChars: st.dayChars || 0,
         quotaLeftEst: Math.max(0, quota - todayReq),
+        checkinToday: st.checkinDay === today ? (st.checkinResult || '') : '',
+        checkinAt: st.checkinAt || 0,
         lastError: st.lastError || '',
       };
     });
@@ -320,6 +339,135 @@ export class DoubaoClient {
     return results;
   }
 
+  // ---------- 每日签到（活动额度） ----------
+  // PC 客户端点「立即签到」走的是 XHR 裸请求：query 不带 a_bogus/msToken，
+  // 头部只需 content-type / accept / agw-js-conv，body 只有 scene。
+
+  /** 活动接口通用 query（实测 21 项，缺项会被服务端拒绝） */
+  _campaignQuery() {
+    const u = this.cfg.upstream || {};
+    return new URLSearchParams({
+      aid: u.aid || '497858',
+      real_aid: u.aid || '497858',
+      device_id: u.device_id || '7707509248230065699',
+      device_platform: 'web',
+      doubao_device_platform: 'web',
+      doubao_pc_version: u.pc_version || '3.45.5',
+      language: u.language || 'zh',
+      pc_version: u.pc_version || '3.45.5',
+      pkg_type: 'release_version',
+      region: u.region || 'CN',
+      samantha_web: '1',
+      sys_region: u.region || 'CN',
+      tea_uuid: u.tea_uuid || u.web_id || '7707509253662393906',
+      tz_name: u.tz_name || 'Asia/Shanghai',
+      'use-olympus-account': '1',
+      version_code: u.version_code || '20800',
+      web_id: u.web_id || '7707509253662393906',
+      web_platform: 'browser',
+      web_tab_id: uuid(),
+      runtime: 'web',
+    }).toString();
+  }
+
+  /** 打活动接口（不带签名，保持与客户端一致的最短头部集） */
+  async _postCampaign(account, apiPath, body) {
+    const url = this.baseUrl + apiPath + '?' + this._campaignQuery();
+    let res;
+    try {
+      res = await fetch(url, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          accept: 'application/json, text/plain, */*',
+          'agw-js-conv': 'str',
+          cookie: account.cookie.trim(),
+          'user-agent': UA,
+        },
+        body: JSON.stringify(body || {}),
+        signal: this._withTimeout(),
+      });
+    } catch (e) {
+      throw new DoubaoError('network', '活动接口网络错误: ' + e.message);
+    }
+    const text = await res.text().catch(() => '');
+    let data = null;
+    try { data = JSON.parse(text); } catch (e) { /* 非 JSON（HTML 错误页等） */ }
+    return { http: res.status, data, text };
+  }
+
+  /** 读取账号今日签到状态：/alice/ug/campaign/v3/detail/ 里 tasks[].daily_checkin.checked_in_today */
+  async getCheckinStatus(account) {
+    const { http, data } = await this._postCampaign(account, '/alice/ug/campaign/v3/detail/', {
+      campaign_group_code: CHECKIN_SCENE,
+    });
+    if (http === 401 || (data && data.code === 401)) throw new DoubaoError('auth', '签到状态查询：登录态失效');
+    if (!data || data.code !== 0) {
+      const code = data && data.code !== undefined ? data.code : http;
+      throw new DoubaoError('upstream', `签到状态查询失败 code=${code} ${(data && (data.message || data.msg)) || ''}`.trim());
+    }
+    const tasks = Array.isArray(data.data && data.data.tasks) ? data.data.tasks : [];
+    const task = tasks.find(t => t && (t.daily_checkin || t.dailyCheckin)) || tasks[0] || null;
+    const ck = task ? (task.daily_checkin || task.dailyCheckin) : null;
+    const checkedInToday = ck ? !!(ck.checked_in_today !== undefined ? ck.checked_in_today : ck.checkedInToday) : false;
+    return { checkedInToday, reward: ck ? (ck.reward || null) : null };
+  }
+
+  /**
+   * 单账号签到：先查状态，未签才发 checkin。
+   * 已签到/当日已失败过都不再重打接口——710010702 是服务端硬拒，重试无意义且易触发风控。
+   */
+  async checkin(account) {
+    const st = this._accState(account.id);
+    const today = dayKeyCN();
+    const status = await this.getCheckinStatus(account);
+    if (status.checkedInToday) {
+      st.checkinDay = today;
+      st.checkinAt = Date.now();
+      st.checkinResult = 'already';
+      this._scheduleSave();
+      return { id: account.id, remark: account.remark || '', result: 'already', reward: status.reward };
+    }
+    if (st.checkinDay === today && st.checkinResult === 'failed') {
+      return { id: account.id, remark: account.remark || '', result: 'skipped', error: st.lastError || '今日签到已失败，跳过重试' };
+    }
+    const { http, data } = await this._postCampaign(account, '/alice/ug/campaign/landing/checkin', { scene: CHECKIN_SCENE });
+    const code = data && data.code !== undefined ? data.code : http;
+    const ok = http === 200 && code === 0;
+    const title = (data && data.data && ((data.data.complete_page_info || {}).title || (data.data.toast || {}).text)) || '';
+    const msg = (data && (data.message || data.msg)) || '';
+    st.checkinDay = today;
+    st.checkinAt = Date.now();
+    st.checkinResult = ok ? 'ok' : 'failed';
+    if (!ok) st.lastError = `签到失败 code=${code} ${msg}`.trim();
+    this._scheduleSave();
+    return {
+      id: account.id,
+      remark: account.remark || '',
+      result: ok ? 'ok' : 'failed',
+      code,
+      title,
+      error: ok ? '' : `code=${code} ${msg}`.trim(),
+      reward: status.reward,
+    };
+  }
+
+  /** 全账号签到；单账号异常不影响其他账号 */
+  async checkinAll(opts = {}) {
+    const only = opts.id ? String(opts.id) : '';
+    const results = [];
+    for (const a of this._accounts()) {
+      if (only && a.id !== only) continue;
+      try {
+        results.push(await this.checkin(a));
+      } catch (e) {
+        if (e.kind === 'auth') this.markAuthError(a, '签到接口登录态失效');
+        results.push({ id: a.id, remark: a.remark || '', result: 'error', error: e.message });
+      }
+    }
+    return results;
+  }
+
   // ---------- 多轮上下文（conversation_id 复用，实测有效） ----------
 
   /**
@@ -336,6 +484,33 @@ export class DoubaoClient {
     // 用上一轮我们实际返回的内容做一致性校验，防止两段不同对话首句相同而串号
     if (e.replyHash && shortHash(lastReplyText) !== e.replyHash) return null;
     return e.conversationId;
+  }
+
+  /**
+   * 规划本轮能否复用上游会话，并算出发送起点。
+   * 与 reusableConversation 的区别：不要求「严格追加一条」。
+   * 宿主每轮常会重排消息、重注入上下文块，条数容易跳变；只要
+   * ① 键相同且在 TTL 内 ② 条数没有回退 ③ 上一条 assistant 与上次返回一致，
+   * 就判定为同一段对话，只发 msgCount 之后的新消息：既不复读历史，也不丢上下文。
+   * @returns {{conversationId: string, fromIndex: number} | null}
+   */
+  planReuse(key, msgs, lastReplyText) {
+    if (!key || this.cfg.contextReuse === false) return null;
+    const e = this.convMap.get(key);
+    if (!e) return null;
+    const ttlMs = (this.cfg.conversationTtlSec ?? 1800) * 1000;
+    if (Date.now() - e.ts > ttlMs) { this.convMap.delete(key); return null; }
+    // 上一条 assistant 与上次返回不一致，说明宿主换了分支/重建了历史，不能复用
+    if (e.replyHash && lastReplyText && shortHash(lastReplyText) !== e.replyHash) return null;
+    const len = Array.isArray(msgs) ? msgs.length : 0;
+    // 条数回退说明历史被截断/压缩，复用上游会话会缺内容，宁可整段重发
+    if (!len || len <= e.msgCount) return null;
+    // 上一轮只发到 user 为止，其后的 assistant 是上游生成的；本轮必须从这条回复之后开始，
+    // 否则会把自己的回复当用户输入再发一遍
+    let from = Math.min(e.msgCount, len - 1);
+    while (from < len - 1 && msgs[from]?.role === 'assistant') from += 1;
+    if (from >= len) return null;
+    return { conversationId: e.conversationId, fromIndex: from };
   }
 
   rememberConversation(key, conversationId, msgCount, replyText) {
@@ -356,8 +531,24 @@ export class DoubaoClient {
   }
 
   resolveModelItemKey(modelId) {
-    const m = this.models().find(x => x.id === modelId);
+    const id = String(modelId || '').trim();
+    if (!id) return null;
+    const list = this.models();
+    const norm = (s) => String(s || '').toLowerCase().replace(/[\s_]+/g, '-');
+    let m = list.find(x => x.id === id)
+      || list.find(x => norm(x.id) === norm(id))
+      || list.find(x => x.modelItemKey === id);
+    if (!m && id.includes('/')) {
+      // 宿主有时把「provider/model」整串传下来，取最后一段再匹配一次
+      const tail = id.slice(id.lastIndexOf('/') + 1);
+      m = list.find(x => x.id === tail) || list.find(x => norm(x.id) === norm(tail));
+    }
     return m ? m.modelItemKey : null;
+  }
+
+  /** 当前插件实际支持的模型 id 列表（报错与面板排查用） */
+  modelIds() {
+    return this.models().map(m => m.id);
   }
 
   // ---------- 上游调用 ----------
@@ -604,8 +795,14 @@ export class DoubaoClient {
    * @returns {AsyncGenerator<string, string>} AI 文本增量（return 值为全文）
    */
   async *chat(modelId, text, signal, opts = {}) {
+    // 记录宿主本轮实际下发的模型名，/doubao/status 与日志据此排查「切换模型没生效」
+    this.lastModel = modelId || '';
+    this.lastModelAt = Date.now();
     const modelItemKey = this.resolveModelItemKey(modelId);
-    if (!modelItemKey) throw new DoubaoError('upstream', `未知模型 ${modelId}`);
+    if (!modelItemKey) {
+      throw new DoubaoError('upstream', `未知模型 ${modelId || '(空)'}：本插件只接豆包账号，可选模型为 ${this.modelIds().join(', ')}`);
+    }
+    this.log('info', `模型映射 ${modelId} -> ${modelItemKey}`);
     const maxAttempts = Math.max(1, this.cfg.maxAttempts ?? 2);
     const tried = new Set();
     let lastErr = null;
