@@ -16,15 +16,26 @@ window.__ModuleLoader__.load({
 
     const inject = ['slots']
 
+    async function req(url, opt) {
+      const r = await fetch(url, opt)
+      const text = await r.text()
+      if (!r.ok) throw new Error('HTTP ' + r.status + (text ? '：' + text.slice(0, 120) : '（接口未注册，插件可能未重启）'))
+      if (!text) throw new Error('接口返回空响应（HTTP ' + r.status + '）')
+      return JSON.parse(text)
+    }
+
     const api = {
-      status: () => fetch('/doubao/status', { cache: 'no-store' }).then(r => r.json()),
-      check: () => fetch('/doubao/check', { method: 'POST' }).then(r => r.json()),
-      enable: (id, enabled) => fetch('/doubao/account/enable', {
+      status: () => req('/doubao/status', { cache: 'no-store' }),
+      check: () => req('/doubao/check', { method: 'POST' }),
+      enable: (id, enabled) => req('/doubao/account/enable', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id, enabled }),
-      }).then(r => r.json()),
-      remove: id => fetch('/doubao/account/remove', {
+      }),
+      remove: id => req('/doubao/account/remove', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ id }),
-      }).then(r => r.json()),
+      }),
+      add: (account) => req('/doubao/account/add', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(account),
+      }),
     }
 
     const S = {
@@ -57,6 +68,8 @@ window.__ModuleLoader__.load({
 
     function Panel() {
       const [data, setData] = useState(null)
+      const [showAdd, setShowAdd] = useState(false)
+      const [form, setForm] = useState({ id: '', remark: '', cookie: '' })
       const [err, setErr] = useState('')
       const [busy, setBusy] = useState('')
       const [log, setLog] = useState('')
@@ -103,7 +116,31 @@ window.__ModuleLoader__.load({
 
         h('div', { style: S.row },
           h('button', { style: S.btn, onClick: load, disabled: !!busy }, '刷新'),
-          h('button', { style: S.btn, onClick: onCheck, disabled: !!busy }, busy === 'check' ? '检查中…' : '全部健康检查')),
+          h('button', { style: S.btn, onClick: onCheck, disabled: !!busy }, busy === 'check' ? '检查中…' : '全部健康检查'),
+          h('button', { style: S.btn, onClick: () => setShowAdd(v => !v) }, showAdd ? '收起' : '添加账号')),
+
+        showAdd ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderRadius: 10, border: '1px solid var(--dsw-alias-border-l2, #e3e6ea)' } },
+          h('div', { style: S.mute }, '把浏览器里豆包网页版的整段 Cookie 粘进来；保存后立即生效，无需重启。'),
+          h('div', { style: S.row },
+            h('input', { placeholder: 'ID（可空，如 acc-2）', value: form.id, style: { flex: '0 1 160px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
+              onChange: e => setForm({ ...form, id: e.target.value }) }),
+            h('input', { placeholder: '备注（如：小号）', value: form.remark, style: { flex: '1 1 160px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
+              onChange: e => setForm({ ...form, remark: e.target.value }) })),
+          h('textarea', { placeholder: 'Cookie（sessionid=...; sid_guard=...）', rows: 3, value: form.cookie,
+            style: { width: '100%', padding: 8, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 12 },
+            onChange: e => setForm({ ...form, cookie: e.target.value }) }),
+          h('div', { style: S.row },
+            h('button', { style: S.btn, disabled: !!busy, onClick: async () => {
+              setBusy('add')
+              try {
+                const r = await api.add(form)
+                setLog('已添加账号 ' + r.id)
+                setForm({ id: '', remark: '', cookie: '' })
+                setShowAdd(false)
+              } catch (e) { setLog('添加失败：' + e.message) }
+              setBusy(''); load()
+            } }, '保存'),
+            h('button', { style: S.btn, onClick: () => setShowAdd(false) }, '取消'))) : null,
 
         h('table', { style: S.table },
           h('thead', null, h('tr', null,
