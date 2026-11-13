@@ -16,7 +16,7 @@ import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
 export const name = 'dsh-doubao-work';
-export const inject = ['llm'];
+export const inject = { required: ['llm'], optional: ['webServer'] };
 
 // ---------------- 配置面板 ----------------
 
@@ -204,6 +204,56 @@ export function apply(ctx, config) {
   log('info', `已注册 provider "${config.providerId}"：${models.map(m => m.id).join(', ')}｜账号 ${accounts.filter(a => a.enabled !== false).length} 个`);
 
   ctx.llm.registerAdapter([config.providerId], new DoubaoLlmAdapter({ client, config, log }));
+
+  // ---------------- 状态接口（本机只读） ----------------
+  // GET  /doubao/status  → 账号池 + 今日用量 + 会话数
+  // POST /doubao/check   → 逐个账号做健康检查
+  try {
+    const web = ctx.webServer;
+    if (web?.register) {
+      web.register({
+        kind: 'exact',
+        path: '/doubao/status',
+        handler: (req, res) => {
+          const snap = client.snapshot();
+          const body = JSON.stringify({
+            provider: config.providerId,
+            models: client.models().map(m => m.id),
+            accounts: snap,
+            summary: {
+              accounts: snap.length,
+              usable: snap.filter(a => a.status === '可用').length,
+              todayReq: snap.reduce((s, a) => s + a.todayReq, 0),
+              quotaLeftEst: snap.reduce((s, a) => s + a.quotaLeftEst, 0),
+            },
+            conversations: client.convMap.size,
+            contextReuse: config.contextReuse !== false,
+          }, null, 2);
+          res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+          res.end(body);
+        },
+      });
+      web.register({
+        kind: 'exact',
+        path: '/doubao/check',
+        handler: async (req, res) => {
+          try {
+            const results = await client.checkAll();
+            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ results }, null, 2));
+          } catch (e) {
+            res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
+            res.end(JSON.stringify({ error: e.message }));
+          }
+        },
+      });
+      log('info', '状态接口已注册：GET /doubao/status  POST /doubao/check');
+    } else {
+      log('warn', '未拿到 webServer 服务，状态接口不可用（命令行工具仍可用）');
+    }
+  } catch (e) {
+    log('warn', '状态接口注册失败：' + e.message);
+  }
 
   // 进程退出时落盘状态
   const flush = () => client.flushState();
