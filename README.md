@@ -49,8 +49,12 @@
 **方式 A：设置页「从浏览器导入」（推荐，1.3.0 起，全程不用碰 F12）**
 
 1. 设置 → 模型接入 → 豆包工作 → 点「从浏览器导入」
-2. 插件会开一个**独立临时配置**的浏览器窗口（Edge/Chrome/Chromium 自动探测），你在里面正常登录豆包
-3. 回到面板点「抓取 Cookie（并入库）」，账号立刻出现在列表里
+2. 插件会开一个**独立临时配置**的浏览器窗口（Edge/Chrome/Chromium 自动探测）
+3. 登录豆包，二选一：
+   - **在面板里填手机号** → 点「发送验证码」→ 收到后填验证码 → 点「登录」（1.5.0 起）；
+     插件把这两个动作送进那个窗口，等同你自己在页面里操作，短信发到的是你填的号
+   - 或者直接在窗口里登（手机号 / 扫码 / 抖音都行）
+4. **登录成功会自动导入账号并关掉窗口**（1.5.0 起）。万一没自动导入，点一下「抓取 Cookie（并入库）」也能补上
 
 **方式 B：粘贴（1.2.6 起自动识别形状）**
 
@@ -89,10 +93,31 @@ profile，不碰你日常浏览器的数据）。**手机版 DSH 不适用**：�
 Application 包装层的布局也认）。想用别的内核浏览器，在插件配置里填 `browserPath` 指向可执行文件即可。
 命令行版：`node tools/browser-import.mjs --wait 300`（`--attach --port 9222` 可连你自己开着的调试端口）。
 
+## 登录助手：手机号在面板里填，登录在浏览器里发生
+
+豆包网页登录走 `accounts.doubao.com` 的 **webmssdk 风控签名**：纯后端重放只会拿到 `非法应用(22)`，
+短信接口也一样（这点在 1.1.x 就实测过，写在 [`docs/豆包接口实测-2026-11-13.md`](docs/豆包接口实测-2026-11-13.md) 里）。
+所以插件**不在后端模拟登录**，而是把「填手机号 / 点发送验证码 / 填验证码 / 点登录」这几个动作
+送进它自己拉起的那个浏览器窗口——页面自己发请求、自己签名，风控看到的就是正常浏览器。
+
+实现（`browser.js` 的 `loginAssist`）：
+
+- 只连 `127.0.0.1` 上的调试端口，用 CDP 的 `Runtime.evaluate` 找元素、`Input.dispatchMouseEvent`
+  点按钮、`Input.insertText` 填字（不是 `el.click()`，点击带真实坐标与按下/抬起序列）
+- 按钮按「整串文字相等」匹配，同名时取离输入框最近的那个（页面顶部还有一个「登录」，
+  早期用「包含」匹配会点到包裹容器上，坐标落在两个按钮之间、页面毫无反应——这是实测踩到的坑）
+- 手机号只进浏览器输入框，插件不落盘、不在接口返回里回传（`/doubao/browser/login` 只回表单形状）
+- 每步都回 `steps`（"已点击「登录」"/"找到 2 个输入框"/"没找到「发送验证码」…"），走不通时面板上能直接看到卡在哪，
+  这时改成在窗口里手动登录即可——**自动导入照样生效**
+
+自动导入（`startLoginWatch`）：窗口一打开就开始每 2.5 秒读一次 Cookie，检测到
+`sessionid`/`sid_guard` 就入库、关窗口、刷新账号列表；5 分钟没等到就停下并在面板上说明原因。
+
 ## 功能
 
 - **多账号池**：轮询/随机调度，Cookie 填多个即可
 - **从浏览器一键导入**（1.3.0）：CDP 抓取，跨 Chromium 内核、拿得到 HttpOnly 登录态、不读浏览器隐私库
+- **登录助手 + 自动导入**（1.5.0）：面板里填手机号/验证码，动作送进那个窗口，登录成功自动入库并关窗
 - **冷却分级**：429/403 长冷却 24h（对应“第二天恢复”）、5xx 空响应 短冷却 5 分钟、Cookie 失效单独标记
 - **单账号 RPM 限速**（默认 6/分钟，可配），防止高频触发风控
 - **失败自动换号重试**；**流中断保护**：已经吐出内容后不再换号重发，避免用户看到重复文本
@@ -172,8 +197,8 @@ dsh-doubao-work/
 ├── client.js          # 浏览器半身：设置页「豆包工作」
 ├── package.json
 ├── cordis.patch.yml
-├── tests/             # smoke.mjs（契约/接口）、upstream.mjs（本地假上游）、
-│                        standalone.mjs（真启动网关打假上游）、profile-install.mjs（安装形态）
+├── tests/             # smoke.mjs（契约/接口）、upstream.mjs（本地假上游）、standalone.mjs（真启动网关打假上游）、
+│                        browser-live.mjs（真开浏览器验登录助手）、profile-install.mjs（安装形态）
 ├── tools/             # status / accounts / panel / browser-import / model-probe / git-api-push
 ├── docs/              # 上游接口实测记录（抓包结论、SSE 事件表、模型 key 对照）
 └── standalone/        # 复用 doubao.js 的 OpenAI 兼容网关（独立进程）
@@ -199,6 +224,8 @@ dsh-doubao-work/
 1.3.0 起多了「从浏览器导入」：点开临时浏览器窗口 → 在里面登录豆包 → 点「抓取 Cookie（并入库）」。
 1.4.0 起工具栏还有「一键签到」（签整个账号池）、每行的「签到」（只签这一个号）、以及
 「导出-导入账号」（账号包，见上文方式 C）。
+1.5.0 起「从浏览器导入」展开后多了一行登录助手：手机号 / 打开登录框 / 发送验证码 / 验证码 / 登录，
+下面实时显示自动导入状态与每一步的结果；导入成功后自动收起窗口并刷新列表。
 停用的账号仍然显示在列表里（状态显示「已停用」），所以随时可以点回来启用。
 「添加账号 / 换 Cookie」的粘贴框会自动识别六种粘贴形状并回显识别结果（见上文「获取 Cookie」），
 空态文案与页脚会直接显示当前账号文件路径（数据目录可能被 `dataDir` 改过，写死路径会误导）；
@@ -207,9 +234,11 @@ dsh-doubao-work/
 离线自检（不重启、不联网、不耗额度）：
 
 ```bash
-node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/浏览器导入(CDP)/模型 key 抓取/签到/账号包/数据目录/错误码/流协议，共 108 项
+node tests/smoke.mjs      # 契约/路由/账号管理/粘贴解析/浏览器导入(CDP)/登录助手/自动导入/模型 key 抓取/签到/账号包/数据目录/错误码/流协议，共 116 项
 node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用/签到/key 验证，共 20 项
 node tests/standalone.mjs # 真启动 standalone 网关（临时目录 + 假上游）：OpenAI 形状/流式/白名单/会话复用，9 项
+ELECTRON_RUN_AS_NODE=1 "<安装目录>/DeepSeek Harness.exe" tests/browser-live.mjs
+                          # 真开浏览器 + 本地假登录页，验证登录助手真的能点开弹窗/填号/发码/登录，6 项
 ELECTRON_RUN_AS_NODE=1 DSH_HOST_MODULES="<安装目录>/app.asar/dsh/node_modules" \
   "<安装目录>/DeepSeek Harness.exe" tests/profile-install.mjs   # 模拟 profile 安装，6 项
 ```
@@ -267,7 +296,8 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
 - `GET  /doubao/status`（或 `/api/doubao/status`）— 账号池（含停用）+ 今日用量 + 会话数 +
   `runtime.host`（宿主包解析来源，排查「装上了但没生效」先看这里）+
   `dataDir` / `accountsPath`（账号文件到底在哪，面板空态就用它）+
-  `checkinSchedule`（配置的每日签到时刻）/ `checkinNextAt`（下次执行时间戳，未开启为 0）
+  `checkinSchedule`（配置的每日签到时刻）/ `checkinNextAt`（下次执行时间戳，未开启为 0）+
+  `loginWatch`（登录助手自动导入的 `{state, account, attempts, reason}`）
 - `POST /doubao/check` — 逐账号健康检查
 - `POST /doubao/account/add|update|enable|remove` — 账号增删改启停（`update` 用于换 Cookie，不用删了再加）。
   `add`/`update` 的 Cookie 字段接受任意常见粘贴形状，成功时返回 `parse`
@@ -279,6 +309,11 @@ GITHUB_TOKEN=ghp_xxx node tools/git-api-push.mjs liuzong2026773/dsh-doubao-work 
   返回 `{port, pid, profileDir, browser, hint}`；已活着则复用同一个窗口（`reused: true`）
 - `POST /doubao/browser/grab` — 抓取并入库（`{port?, id?, remark?, save?}`，`save:false` 只回结果不写文件）；
   成功返回 `{ok:true, describe, doubaoCookies, httpOnly, keys, id}`，没登录返回 `{ok:false, stage:'login', reason}`
+- `POST /doubao/browser/login` — 登录助手：`{action:'probe'|'open'|'phone'|'code', phone?, code?, port?}` →
+  `{ok, stage, steps, form:{inputs,hasSendButton,hasSubmitButton,pageText}}`；`stage` 取值
+  `form`/`sent`/`submitted`/`no-login-button`/`no-form`/`no-send-button`/`no-submit`/`bad-phone`/`bad-code`。
+  手机号/验证码**不会**出现在返回里
+- `POST /doubao/browser/wait` — 自动导入状态：`{state:'idle'|'watching'|'done'|'timeout'|'closed', imported, account, attempts, reason}`
 - `POST /doubao/browser/close` — 结束拉起的浏览器进程并清理临时 profile
 - `POST /doubao/accounts/export` — 导出账号包：`{ok, count, accounts, json}`，`json` 就是能整体复制的那段
 - `POST /doubao/accounts/import` — 导入账号包或单条 Cookie：`{text, mode:'merge'|'replace'}` →
@@ -351,12 +386,30 @@ node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
 - `standalone/` 已在 1.4.0 **改成直接复用 `doubao.js`**（账号池/RPM/冷却/SSE/会话复用只有一份实现），
   并补了 `tests/standalone.mjs`。仍**不支持 function calling**（上游没有这个能力），也没有接浏览器导入。
 - 签到：面板「一键签到」+ 每日定时（`checkinSchedule` + 启动后补签）都已接线完成，见「更新记录」1.4.0。
-- 扫码 / 短信登录仍不可行：登录页走 `accounts.doubao.com` 的 webmssdk 风控签名，纯后端模拟只会得到
-  `非法应用(22)`；真扫码需要宿主开内嵌窗口（WebContents，登录后从那个 session 读 Cookie），
-  DSH 插件 API 目前不暴露窗口能力——这条得向宿主提需求。
+- **后端**扫码/短信登录仍不可行（webmssdk，`非法应用(22)`）。1.5.0 改成"面板填号 → 动作送进我们开的窗口"，
+  页面自己签名，所以不需要宿主暴露 WebContents；代价是必须开着那个临时窗口。
+  若宿主将来提供内嵌窗口 API，这套 CDP 驱动就能整个搬进 DSH 自己的页面里（连窗口都不用另开）。
 
 ## 更新记录
 
+- **1.5.0**（2026-11-13，登录助手 + 自动导入，修「抓取失败 HTTP 500」）：
+  - **修 P0：数据目录解析把函数当成路径**。宿主注册的是 `dshHomePath(...segments)` **函数**，
+    旧代码 `String(ctx.get('dshHomePath'))` 把函数源码拼进了路径，于是
+    `accountsPath` 变成 `…function dshHomePath(){…}…/doubao-work/accounts.json`，
+    一写就 `ENOENT`（面板上就是「抓取失败：HTTP 500 … no such file or directory」）。
+    现在按函数调用取返回值，并加了一道「返回值不像路径就落回 `~/.dsh/doubao-work`」的兜底；
+    `/doubao/status` 的 `dataDir` / `accountsPath` 也终于显示真实路径了。
+  - **登录助手**：面板里填手机号 → 「发送验证码」→ 填验证码 → 「登录」，动作通过 CDP
+    （`Runtime.evaluate` 定位 + `Input.dispatchMouseEvent` 点击 + `Input.insertText` 填字）送进插件
+    自己拉起的那个窗口。后端不模拟登录（webmssdk 签名只在页面上下文成立），手机号不落盘、
+    不回传前端，每步回 `steps` 便于排障。
+  - **登录后自动导入**：窗口一开就每 2.5 秒读一次 Cookie，检测到 `sessionid`/`sid_guard` 自动入库、
+    关窗口、刷新列表；5 分钟超时会停并在面板说明。手动在窗口里登录同样会触发。
+  - **修 `safeTempDir`**：从 Git Bash/MSYS 启动时 `os.tmpdir()` 可能是 `/tmp`，
+    传给 Windows 浏览器会变成非法 `--user-data-dir`（窗口闪一下就没了、调试端口从不监听），
+    现在换成真正的 Windows 临时目录。
+  - **测试**：smoke 108 → 116（登录助手 6 项 + 自动导入 2 项），新增 `tests/browser-live.mjs`
+    （真开浏览器 + 本地假登录页，6 项，验证点击/填字/发码/提交真的生效）。
 - **1.4.0**（2026-11-13，签到/账号包/模型 key/standalone 合并）：
   - **每日自动签到**：面板加「一键签到」（整池）与每行「签到」（单号）；配置 `checkinSchedule: "09:30"`
     后每天到点自动签，`checkinCatchUp: true`（默认）时启动后 15 秒发现"今天还没签"会自动补一次。

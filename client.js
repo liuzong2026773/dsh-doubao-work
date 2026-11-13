@@ -51,6 +51,12 @@ window.__ModuleLoader__.load({
       browserClose: (opt) => req('/api/doubao/browser/close', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opt || {}),
       }),
+      browserLogin: (opt) => req('/api/doubao/browser/login', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(opt || {}),
+      }),
+      browserWait: () => req('/api/doubao/browser/wait', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
+      }),
       exportAccounts: () => req('/api/doubao/accounts/export', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
       }),
@@ -97,6 +103,10 @@ window.__ModuleLoader__.load({
       const [busy, setBusy] = useState('')
       const [log, setLog] = useState('')
       const [browser, setBrowser] = useState(null) // 从浏览器导入：{port, browser:{name}, hint}
+      const [phone, setPhone] = useState('')       // 登录助手：手机号
+      const [code, setCode] = useState('')         // 登录助手：短信验证码
+      const [loginStep, setLoginStep] = useState(null) // 上一步登录助手的结果 {ok, stage, steps, form}
+      const [watch, setWatch] = useState(null)     // 自动导入状态 {state, account, reason, imported}
       const [syncMode, setSyncMode] = useState(null) // 'export' | 'import' | null
       const [syncText, setSyncText] = useState('')
 
@@ -181,8 +191,56 @@ window.__ModuleLoader__.load({
       }
       const onBrowserClose = async () => {
         try { await api.browserClose({ port: browser && browser.port }) } catch (e) {}
-        setBrowser(null); setLog('已关闭导入用的浏览器窗口（临时配置已清理）')
+        setBrowser(null); setLoginStep(null); setWatch(null)
+        setLog('已关闭导入用的浏览器窗口（临时配置已清理）')
       }
+
+      // ---- 登录助手：手机号 / 验证码 在面板里填，动作送进我们打开的那个窗口 ----
+      const runLogin = async (action, label) => {
+        setBusy(action); setLog(label + '…')
+        try {
+          const r = await api.browserLogin({ port: browser && browser.port, action, phone, code })
+          setLoginStep(r)
+          const head = r.ok
+            ? (r.stage === 'sent' ? '验证码已发出，收到后填到下面点「登录」'
+              : r.stage === 'form' ? '登录弹窗已打开，可以填手机号了'
+              : r.stage === 'submitted' ? '已提交登录，正在等结果…'
+              : '已完成')
+            : '没走通（stage=' + r.stage + '）'
+          setLog(head + '\n' + (r.steps || []).join('\n')
+            + (r.ok ? '' : '\n\n可以直接在那个浏览器窗口里手动登录，插件检测到登录态会自动导入。'))
+        } catch (e) {
+          setLog('登录助手失败：' + (e.message || e))
+        }
+        setBusy('')
+      }
+      const onOpenLoginForm = () => runLogin('open', '正在点开登录弹窗')
+      const onSendCode = () => runLogin('phone', '正在填入手机号并点「发送验证码」')
+      const onSubmitCode = () => runLogin('code', '正在填入验证码并点「登录」')
+
+      // 登录完自动导入：轮询后台状态，导入成功就收起窗口并刷新账号
+      useEffect(() => {
+        if (!browser) return undefined
+        let alive = true
+        let timer = null
+        const tick = async () => {
+          try {
+            const r = await api.browserWait()
+            if (!alive) return
+            setWatch(r)
+            if (r.imported && r.account) {
+              setLog('登录成功，已自动导入账号 ' + r.account + '（导入窗口已关闭，不用再点抓取）')
+              setBrowser(null); setWatch(null); setLoginStep(null)
+              setPhone(''); setCode('')
+              load()
+              return
+            }
+          } catch (e) { /* 接口还没就绪就等下一轮 */ }
+          if (alive) timer = setTimeout(tick, 2500)
+        }
+        timer = setTimeout(tick, 1500)
+        return () => { alive = false; if (timer) clearTimeout(timer) }
+      }, [browser, load])
 
       // ---- 账号包导出 / 导入：手机同步、备份、多机迁移 ----
       const onExport = async () => {
@@ -238,6 +296,31 @@ window.__ModuleLoader__.load({
           h('div', { style: S.mute },
             '导入窗口已打开：' + ((browser.browser && browser.browser.name) || '浏览器') + '，调试端口 127.0.0.1:' + browser.port
             + '。这是插件专用的临时配置（不碰你日常的浏览器数据），请在里面登录豆包，然后点「抓取 Cookie」。'),
+          h('div', { style: { display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' } },
+            h('input', {
+              placeholder: '手机号', value: phone, inputMode: 'numeric',
+              style: { flex: '0 1 140px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
+              onChange: e => setPhone(e.target.value),
+            }),
+            h('button', { style: S.btn, onClick: onOpenLoginForm, disabled: !!busy }, busy === 'open' ? '打开中…' : '打开登录框'),
+            h('button', { style: S.btn, onClick: onSendCode, disabled: !!busy }, busy === 'phone' ? '发送中…' : '发送验证码'),
+            h('input', {
+              placeholder: '短信验证码', value: code, inputMode: 'numeric',
+              style: { flex: '0 1 120px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
+              onChange: e => setCode(e.target.value),
+            }),
+            h('button', { style: S.btn, onClick: onSubmitCode, disabled: !!busy }, busy === 'code' ? '登录中…' : '登录')),
+          h('div', { style: S.mute },
+            '手机号全程只发给豆包登录页（跟我们打开的那个窗口里手动输一模一样），插件不保存号码。'
+            + '登录成功会自动导入账号并关闭窗口；如果这几个按钮没反应，直接在窗口里登录也一样会自动导入。'),
+          watch ? h('div', { style: S.mute },
+            '自动导入：' + (watch.imported ? '✓ 已导入账号 ' + watch.account
+              : watch.state === 'watching' ? '等待登录完成…（已检查 ' + (watch.attempts || 0) + ' 次）' + (watch.reason ? '｜' + watch.reason : '')
+              : watch.state === 'timeout' ? '超时了：' + (watch.reason || '请在窗口里登录后点「抓取 Cookie（并入库）」')
+              : (watch.reason || watch.state || ''))) : null,
+          loginStep && loginStep.steps && loginStep.steps.length ? h('div', {
+            style: { fontFamily: 'monospace', fontSize: 11, whiteSpace: 'pre-wrap', color: 'var(--dsw-alias-text-l3, #666)' },
+          }, loginStep.steps.join('\n')) : null,
           h('div', { style: S.row },
             h('button', { style: S.btn, onClick: onBrowserGrab, disabled: !!busy }, busy === 'grab' ? '抓取中…' : '抓取 Cookie（并入库）'),
             h('button', { style: S.btn, onClick: onBrowserClose, disabled: !!busy }, '关闭窗口'))) : null,

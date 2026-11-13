@@ -44,7 +44,8 @@ const DOUBAO_DOMAINS = ['doubao.com'];
  * （普通 node 20 连全局 WebSocket 都没有）的环境里把整条链路跑通。
  * 优先级：函数入参 > 这里的全局注入 > 真实实现。
  */
-export const injectable = { fetchImpl: null, createSocket: null, spawnImpl: null, existsSync: null, findFreePort: null, killImpl: null };
+export const injectable = {
+  tmpdir: null, fetchImpl: null, createSocket: null, spawnImpl: null, existsSync: null, findFreePort: null, killImpl: null };
 
 function makeDeps(deps = {}) {
   const pick = (k, fallback) => deps[k] ?? injectable[k] ?? fallback;
@@ -56,6 +57,7 @@ function makeDeps(deps = {}) {
     findFreePort: pick('findFreePort', defaultFindFreePort),
     killImpl: pick('killImpl', defaultKill),
     homedir: deps.homedir || os.homedir(),
+    tmpdir: pick('tmpdir', () => os.tmpdir()),
   };
 }
 
@@ -278,6 +280,25 @@ export function sweepStaleProfiles(dir, maxAgeMs = 6 * 3600 * 1000) {
 }
 
 /**
+ * 临时目录兜底：从 Git Bash / MSYS 里启动时 os.tmpdir() 可能给 `/tmp`，
+ * 这种 POSIX 风格路径传给 Windows 的 Edge/Chrome 会被当成相对路径，浏览器直接起不来
+ * （表现为「窗口闪一下、调试端口从没监听」）。这里换成真正的 Windows 临时目录。
+ */
+export function safeTempDir(deps = {}) {
+  const d = makeDeps(deps);
+  let dir = '';
+  try { dir = String(d.tmpdir ? d.tmpdir() : os.tmpdir()); } catch { dir = ''; }
+  const posixy = /^[\/\\]/.test(dir) || /^[a-zA-Z]:[\/\\]?$/.test(dir);
+  if (process.platform === 'win32' && posixy) {
+    dir = String(process.env.TEMP || process.env.TMP || process.env.LOCALAPPDATA || '').trim();
+    if (!/^[a-zA-Z]:[\\/]/.test(dir)) dir = path.join(os.homedir(), 'AppData', 'Local', 'Temp');
+  }
+  if (!dir) dir = os.homedir();
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 用不了就在原目录里试 */ }
+  return dir;
+}
+
+/**
  * 拉起一个带调试端口的浏览器窗口。
  * 关键：必须用**独立的临时 user-data-dir**——Chrome 136 起，默认配置目录上的
  * --remote-debugging-port 会被静默忽略（安全加固），很多老教程因此失效；
@@ -291,7 +312,7 @@ export async function launchBrowser(opts = {}, deps = {}) {
   if (!browser) throw new Error('没有找到可用的 Chromium 内核浏览器（Edge/Chrome/Chromium），可在配置里填 browserPath');
 
   const port = opts.port || await d.findFreePort();
-  const profileDir = opts.profileDir || path.join(sweepStaleProfiles(os.tmpdir()), `dsh-doubao-cdp-${Date.now()}`);
+  const profileDir = opts.profileDir || path.join(sweepStaleProfiles(safeTempDir(deps)), `dsh-doubao-cdp-${Date.now()}`);
   fs.mkdirSync(profileDir, { recursive: true });
   const args = [
     `--remote-debugging-port=${port}`,
@@ -477,4 +498,193 @@ export async function captureModelKeys(opts = {}, deps = {}) {
       finish(new Error('WebSocket 失败：' + (e?.message || '连接被拒')));
     });
   });
+}
+
+// ---------------- 登录助手（在插件面板里填手机号/验证码，驱动我们打开的那个窗口） ----------------
+
+/** 页面里「登录表单现在长什么样」的探针：只读，返回输入框与按钮的位置 */
+export const LOGIN_PROBE_JS = `(() => {
+  const vis = (el) => { const r = el.getBoundingClientRect(); const s = getComputedStyle(el); return r.width > 4 && r.height > 4 && s.visibility !== 'hidden' && s.display !== 'none'; };
+  const mid = (el) => { const r = el.getBoundingClientRect(); return { x: Math.round(r.left + r.width / 2), y: Math.round(r.top + r.height / 2) }; };
+  const inputs = [...document.querySelectorAll('input,textarea')].filter(vis).map(el => ({
+    type: el.getAttribute('type') || 'text',
+    ph: el.getAttribute('placeholder') || '',
+    val: el.value || '',
+    maxlength: Number(el.getAttribute('maxlength') || 0),
+    ...mid(el),
+  }));
+  // 只认真正的可点元素、且文本整串相等：之前用「包含」匹配会选中把多个按钮包在一起的容器，
+  // 点击坐标落在两个按钮之间，页面毫无反应
+  const cands = [...document.querySelectorAll('button,[role=button],a,input[type=button],input[type=submit]')].filter(vis)
+    .map(el => ({ el, text: (el.innerText || el.value || '').trim().replace(/\\s+/g, ' ') }))
+    .filter(x => x.text);
+  const pick = (re, anchor) => {
+    const hits = cands.filter(x => re.test(x.text));
+    if (!hits.length) return null;
+    let el = hits[0].el;
+    if (hits.length > 1 && anchor) {
+      // 同名按钮有多个时（页面顶部也有一个「登录」），取离输入框最近的那个
+      let best = Infinity;
+      for (const h of hits) {
+        const m = mid(h.el);
+        const dist = Math.abs(m.x - anchor.x) + Math.abs(m.y - anchor.y);
+        if (dist < best) { best = dist; el = h.el; }
+      }
+    }
+    return { ...mid(el), text: (el.innerText || el.value || '').trim().replace(/\\s+/g, ' ') };
+  };
+  const anchor = inputs[inputs.length - 1] || null;
+  return {
+    url: location.href,
+    inputs,
+    loginBtn: pick(/^登录$/),
+    sendBtn: pick(/^(发送验证码|获取验证码|发送|重新发送)$/, inputs[0] || null),
+    submitBtn: pick(/^(登录|确定|下一步|验证|立即登录)$/, anchor),
+    text: (document.body.innerText || '').replace(/\s+/g, ' ').slice(0, 240),
+  };
+})()`;
+
+/** 打开一条到页面 target 的 CDP 连接（内部用，含 id 管理与 close） */
+async function openCdp(port, deps = {}) {
+  const d = makeDeps(deps);
+  const listRes = await d.fetchImpl(`http://127.0.0.1:${port}/json/list`, { signal: AbortSignal.timeout(3000) });
+  const targets = await listRes.json();
+  const page = (targets || []).find(t => t.type === 'page' && /doubao\.com/.test(t.url || ''))
+    || (targets || []).find(t => t.type === 'page');
+  if (!page || !page.webSocketDebuggerUrl) throw new Error('没有找到页面标签页（先在窗口里打开 www.doubao.com）');
+  const ws = d.createSocket(page.webSocketDebuggerUrl);
+  const pending = new Map();
+  let seq = 0;
+  ws.addEventListener('message', (ev) => {
+    let msg;
+    try { msg = JSON.parse(typeof ev.data === 'string' ? ev.data : String(ev.data)); } catch { return; }
+    if (msg.id && pending.has(msg.id)) {
+      const p = pending.get(msg.id);
+      pending.delete(msg.id);
+      if (msg.error) p.reject(new Error(msg.error.message || 'CDP 错误')); else p.resolve(msg.result);
+    }
+  });
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('CDP 连接超时')), 6000);
+    ws.addEventListener('open', () => { clearTimeout(timer); resolve(); });
+    ws.addEventListener('error', () => { clearTimeout(timer); reject(new Error('CDP 连接被拒')); });
+  });
+  const send = (method, params = {}) => new Promise((resolve, reject) => {
+    const id = ++seq;
+    pending.set(id, { resolve, reject });
+    ws.send(JSON.stringify({ id, method, params }));
+  });
+  return { send, close: () => { try { ws.close(); } catch { /* ignore */ } } };
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/** 点一下（走 Input 域，页面按真实鼠标事件处理，而不是 el.click()） */
+async function clickAt(cdp, x, y) {
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x, y, button: 'none', clickCount: 0 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', clickCount: 1 });
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x, y, button: 'left', clickCount: 1 });
+}
+
+async function probeLogin(cdp) {
+  const r = await cdp.send('Runtime.evaluate', { expression: LOGIN_PROBE_JS, returnByValue: true });
+  return r.result?.value || {};
+}
+
+/**
+ * 登录助手：把「填手机号 → 发验证码 → 填验证码 → 登录」这几个动作送进我们拉起的那个窗口。
+ * 页面自己发起请求、自己签名（webmssdk 只在页面上下文里成立），所以风控看到的是正常浏览器操作。
+ *
+ * action:
+ *   'probe' 只看表单现在什么样
+ *   'open'  打开登录弹窗（点页面上的「登录」）
+ *   'phone' 填手机号并点「发送验证码」
+ *   'code'  填验证码并点「登录」
+ */
+export async function loginAssist(opts = {}, deps = {}) {
+  const port = Number(opts.port) || 9222;
+  const action = String(opts.action || 'probe');
+  const phone = String(opts.phone || '').replace(/[^\d]/g, '');
+  const code = String(opts.code || '').replace(/[^\d]/g, '');
+  const steps = [];
+  const cdp = await openCdp(port, deps);
+  try {
+    let form = await probeLogin(cdp);
+    steps.push(`页面：${form.url || '?'}`);
+
+    if (action === 'probe') return { ok: true, stage: form.inputs?.length ? 'form' : 'idle', form, steps };
+
+    if (action === 'open' || (action === 'phone' && !form.inputs?.length)) {
+      if (!form.inputs?.length) {
+        if (!form.loginBtn) {
+          steps.push('页面上没找到「登录」按钮：可能已经登录了，或页面还没加载完');
+          return { ok: false, stage: 'no-login-button', form, steps };
+        }
+        await clickAt(cdp, form.loginBtn.x, form.loginBtn.y);
+        steps.push('已点击页面上的「登录」');
+        for (let i = 0; i < 8; i++) {
+          await sleep(400);
+          form = await probeLogin(cdp);
+          if (form.inputs?.length) break;
+        }
+      }
+      if (!form.inputs?.length) {
+        steps.push('点了「登录」但没等到输入框：可能弹出了扫码/其他登录方式，请在窗口里手动完成');
+        return { ok: false, stage: 'no-form', form, steps };
+      }
+      steps.push(`找到 ${form.inputs.length} 个输入框`);
+      if (action === 'open') return { ok: true, stage: 'form', form, steps };
+    }
+
+    if (!form.inputs?.length) return { ok: false, stage: 'no-form', form, steps };
+
+    // 手机号框：优先 tel 类型，其次第一个（验证码框不会是第一个）
+    const phoneBox = form.inputs.find(i => i.type === 'tel') || form.inputs[0];
+    const codeBox = form.inputs.find(i => i !== phoneBox && (/验证码|code/i.test(i.ph) || i.maxlength === 6 || i.maxlength === 4))
+      || form.inputs[1];
+
+    if (action === 'phone') {
+      if (!/^\d{6,15}$/.test(phone)) return { ok: false, stage: 'bad-phone', form, steps: steps.concat('手机号看起来不对') };
+      await clickAt(cdp, phoneBox.x, phoneBox.y);
+      await cdp.send('Input.insertText', { text: phone });
+      steps.push('已填入手机号');
+      await sleep(400);
+      form = await probeLogin(cdp);
+      const filled = form.inputs?.some(i => /^\d{6,15}$/.test(i.val || ''));
+      steps.push(filled ? '输入框里已确认有号码' : '没读到输入框的值（可能被页面重渲染）');
+      if (!form.sendBtn) {
+        steps.push('没找到「发送验证码」：可能要先勾选协议，或在窗口里手动点');
+        return { ok: false, stage: 'no-send-button', form, steps };
+      }
+      await clickAt(cdp, form.sendBtn.x, form.sendBtn.y);
+      steps.push(`已点击「${form.sendBtn.text}」`);
+      await sleep(1200);
+      form = await probeLogin(cdp);
+      return { ok: true, stage: 'sent', form, steps };
+    }
+
+    if (action === 'code') {
+      if (!/^\d{4,8}$/.test(code)) return { ok: false, stage: 'bad-code', form, steps: steps.concat('验证码看起来不对') };
+      const target = codeBox || phoneBox;
+      await clickAt(cdp, target.x, target.y);
+      await cdp.send('Input.insertText', { text: code });
+      steps.push('已填入验证码');
+      await sleep(400);
+      form = await probeLogin(cdp);
+      if (!form.submitBtn) {
+        steps.push('没找到「登录」提交按钮：请在窗口里手动点一下');
+        return { ok: false, stage: 'no-submit', form, steps };
+      }
+      await clickAt(cdp, form.submitBtn.x, form.submitBtn.y);
+      steps.push(`已点击「${form.submitBtn.text}」`);
+      await sleep(1500);
+      form = await probeLogin(cdp);
+      const done = !form.inputs?.length;
+      return { ok: done, stage: done ? 'submitted' : 'pending', form, steps };
+    }
+
+    return { ok: false, stage: 'unknown-action', form, steps: steps.concat(`未知动作 ${action}`) };
+  } finally {
+    cdp.close();
+  }
 }

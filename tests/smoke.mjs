@@ -43,7 +43,7 @@ const ctx = {
 console.log('加载与注册');
 ok('apply 不抛异常', () => mod.apply(ctx, { providerId: 'doubao-work', providerName: '测试', accounts: [], dataDir: DATA_DIR }));
 ok('注册了 provider', () => assert.deepEqual(adapterProviders, ['doubao-work']));
-ok('注册了预期路由集合（16 精确 + 1 /api 前缀）', () => {
+ok('注册了预期路由集合（18 精确 + 1 /api 前缀）', () => {
   assert.deepEqual(Object.keys(routes).sort(), [
     '/api/doubao',
     '/doubao/account/add',
@@ -60,6 +60,8 @@ ok('注册了预期路由集合（16 精确 + 1 /api 前缀）', () => {
     '/doubao/checkin',
     '/doubao/checkin/status',
     '/doubao/models/probe',
+    '/doubao/browser/login',
+    '/doubao/browser/wait',
     '/doubao/status',
   ].sort());
 });
@@ -876,6 +878,112 @@ ok('groupCookiesByDomain 区分豆包域与其他域（排障用）', () => {
   assert.equal(r.doubao.length, 2);
   assert.deepEqual(r.otherDomains, ['google.com']);
 });
+
+// ---------------- 登录助手 + 自动导入 ----------------
+console.log('登录助手');
+{
+  const origCreate = browserMod.injectable.createSocket;
+  const form = {
+    url: 'https://www.doubao.com/chat/',
+    inputs: [{ type: 'tel', ph: '请输入手机号', val: '13800138000', maxlength: 11, x: 10, y: 10 }],
+    loginBtn: { x: 1, y: 2, text: '登录' },
+    sendBtn: { x: 3, y: 4, text: '发送验证码' },
+    submitBtn: { x: 5, y: 6, text: '登录' },
+    text: '请输入手机号 发送验证码 登录',
+  };
+  const sent = [];
+  browserMod.injectable.createSocket = () => {
+    const listeners = {};
+    return {
+      addEventListener: (t, fn) => { (listeners[t] = listeners[t] || []).push(fn); if (t === 'open') queueMicrotask(() => fn()); },
+      send: (raw) => {
+        const msg = JSON.parse(raw);
+        sent.push(msg.method);
+        let result = {};
+        if (msg.method === 'Runtime.evaluate') result = { result: { value: form } };
+        else if (msg.method === 'Storage.getCookies') result = { cookies: [] }; // 还没登录：空 Cookie
+        queueMicrotask(() => (listeners.message || []).forEach(fn => fn({ data: JSON.stringify({ id: msg.id, result }) })));
+      },
+      close: () => {},
+    };
+  };
+
+  const probeRes = await call('/doubao/browser/login', { action: 'probe', port: cdpPort });
+  const probeBody = JSON.parse(probeRes.body);
+  ok('browser/login probe：回表单形状、不回填进去的手机号', () => {
+    assert.equal(probeRes.code, 200);
+    assert.equal(probeBody.stage, 'form');
+    assert.equal(probeBody.form.inputs, 1);
+    assert.equal(probeBody.form.hasSendButton, true);
+    assert.equal(JSON.stringify(probeBody).includes('13800138000'), false, '手机号不能回传前端');
+  });
+
+  const phoneRes = await call('/doubao/browser/login', { action: 'phone', phone: '13800138000', port: cdpPort });
+  const phoneBody = JSON.parse(phoneRes.body);
+  ok('browser/login phone：填入手机号并点「发送验证码」', () => {
+    assert.equal(phoneBody.stage, 'sent', JSON.stringify(phoneBody));
+    assert.ok(phoneBody.steps.some(t => /已点击「发送验证码」/.test(t)), '步骤里要有发送动作');
+    assert.ok(sent.includes('Input.insertText'), '要用 Input.insertText 填字');
+    assert.ok(sent.includes('Input.dispatchMouseEvent'), '要用真实鼠标事件点击');
+  });
+
+  const waitRes = await call('/doubao/browser/wait', {});
+  const waitBody = JSON.parse(waitRes.body);
+  ok('browser/wait：发码后进入自动导入等待（还没登录就不算导入）', () => {
+    assert.equal(waitBody.state, 'watching');
+    assert.equal(waitBody.imported, false);
+    assert.equal(waitBody.account, '');
+  });
+
+  const badRes = await call('/doubao/browser/login', { action: 'code', code: '12', port: cdpPort });
+  ok('browser/login code：验证码太短直接拒绝', () => {
+    assert.equal(JSON.parse(badRes.body).stage, 'bad-code');
+  });
+
+  const closeRes = await call('/doubao/browser/close', {});
+  ok('browser/close：关窗口时停掉自动导入轮询', () => {
+    assert.equal(closeRes.code, 200);
+  });
+  const after = JSON.parse((await call('/doubao/browser/wait', {})).body);
+  ok('关闭后自动导入状态不再是 watching', () => assert.notEqual(after.state, 'watching'));
+
+  // 登录成功后自动导入：把假 CDP 的 Cookie 换成带登录态的，等轮询把账号收进来
+  browserMod.injectable.createSocket = () => {
+    const listeners = {};
+    return {
+      addEventListener: (t, fn) => { (listeners[t] = listeners[t] || []).push(fn); if (t === 'open') queueMicrotask(() => fn()); },
+      send: (raw) => {
+        const msg = JSON.parse(raw);
+        let result = {};
+        if (msg.method === 'Runtime.evaluate') result = { result: { value: form } };
+        else if (msg.method === 'Storage.getCookies') {
+          result = { cookies: [
+            { name: 'sessionid', value: 'logged-in-session', domain: '.doubao.com', path: '/', httpOnly: true },
+            { name: 'sid_guard', value: 'guard-value', domain: '.doubao.com', path: '/', httpOnly: true },
+            { name: 'ttwid', value: 'tt', domain: '.doubao.com', path: '/', httpOnly: false },
+          ] };
+        }
+        queueMicrotask(() => (listeners.message || []).forEach(fn => fn({ data: JSON.stringify({ id: msg.id, result }) })));
+      },
+      close: () => {},
+    };
+  };
+  await call('/doubao/browser/login', { action: 'phone', phone: '13900139000', port: cdpPort });
+  await new Promise(r => setTimeout(r, 2600)); // 自动导入每 2.5s 检查一次
+  const imported = JSON.parse((await call('/doubao/browser/wait', {})).body);
+  ok('登录检测到登录态后自动导入账号（不用再点抓取）', () => {
+    assert.equal(imported.state, 'done', JSON.stringify(imported));
+    assert.equal(imported.imported, true);
+    assert.ok(imported.account, '应回报导入的账号 id');
+    assert.match(imported.reason, /已导入账号/);
+  });
+  const stAfter = JSON.parse((await call('/doubao/status')).body);
+  ok('自动导入的账号真的进了账号池', () => {
+    assert.ok(stAfter.accounts.some(a => a.id === imported.account), JSON.stringify(stAfter.accounts.map(a => a.id)));
+  });
+
+  browserMod.injectable.createSocket = origCreate;
+}
 
 cdp.close();
 for (const k of Object.keys(browserMod.injectable)) browserMod.injectable[k] = null;

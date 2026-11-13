@@ -11,7 +11,7 @@
 import { Schema, LlmAdapter, LlmError, resolvedFrom } from './host.js';
 import { dataPaths } from './paths.js';
 import { parseCookieInput, describeParse } from './cookie-input.js';
-import { candidateBrowsers, launchBrowser, grabDoubao, closeBrowser } from './browser.js';
+import { candidateBrowsers, launchBrowser, grabDoubao, closeBrowser, loginAssist } from './browser.js';
 import { DoubaoClient, DoubaoError, BUILTIN_MODELS, conversationKey } from './doubao.js';
 import path from 'node:path';
 import fs from 'node:fs';
@@ -81,7 +81,7 @@ export const Config = Schema && Schema.object({
 });
 
 /** 插件版本（与 package.json 同步，状态接口用于排障） */
-export const VERSION = '1.4.0';
+export const VERSION = '1.5.0';
 
 /**
  * 配置默认值。
@@ -375,7 +375,18 @@ export function apply(ctx, rawConfig) {
   // Cookie 与用量状态不放插件目录：profile 安装的插件在 node_modules 里，
   // 升级会被整目录重抄，Cookie 会丢。见 paths.js。
   let dshHome = '';
-  try { dshHome = String(ctx?.get?.('dshHomePath') || ''); } catch (e) { /* 测试用的 ctx 没有这个服务 */ }
+  try {
+    // 宿主注册的是函数 dshHomePath(...segments)，不是字符串：直接 String() 会把函数源码
+    // 当成目录名（表现为 accounts.json 落到 "...function dshHomePath..." 这种路径下 → ENOENT）
+    const v = ctx?.get?.('dshHomePath');
+    if (typeof v === 'function') dshHome = String(v() || '').trim();
+    else if (typeof v === 'string') dshHome = v.trim();
+  } catch (e) { /* 测试用的 ctx 没有这个服务 */ }
+  if (dshHome && /[\r\n]|function\s|=>/.test(dshHome)) {
+    // 兜底：拿到的不是路径就当没拿到，落回 ~/.dsh/doubao-work
+    log('warn', 'dshHomePath 返回的不是路径，改用 ~/.dsh');
+    dshHome = '';
+  }
   const files = dataPaths({
     explicit: config.dataDir,
     dshHome,
@@ -449,6 +460,64 @@ export function apply(ctx, rawConfig) {
   let statusRouteDisposers = [];
   /** 「从浏览器导入」拉起的浏览器窗口句柄（pid / 调试端口 / 临时 profile），同一次 apply 内复用 */
   let browserHandle = null;
+  // 登录助手 + 自动导入：登录完成后不用再点「抓取」，后台自己把 Cookie 收进账号池
+  const loginWatch = { state: 'idle', startedAt: 0, attempts: 0, lastReason: '', account: '', importedAt: 0 };
+  // 入库函数定义在「注册路由」那段作用域里（依赖 accounts 文件的读写助手），这里用钩子接过来，
+  // 免得把账号文件逻辑复制一份
+  let saveAccountCookieImpl = null;
+  let loginWatchTimer = null;
+  const stopLoginWatch = () => { if (loginWatchTimer) { clearTimeout(loginWatchTimer); loginWatchTimer = null; } };
+  const summarizeForm = (form) => ({
+    url: form?.url || '',
+    inputs: (form?.inputs || []).length,
+    types: (form?.inputs || []).map(i => i.type || 'text'),
+    hasSendButton: !!form?.sendBtn,
+    hasSubmitButton: !!form?.submitBtn,
+    pageText: String(form?.text || '').slice(0, 120),
+  });
+  const startLoginWatch = (port, why) => {
+    stopLoginWatch();
+    loginWatch.state = 'watching';
+    loginWatch.startedAt = Date.now();
+    loginWatch.attempts = 0;
+    loginWatch.account = '';
+    loginWatch.importedAt = 0;
+    loginWatch.lastReason = '等待登录完成…';
+    const deadline = Date.now() + 5 * 60 * 1000;
+    const tick = async () => {
+      loginWatchTimer = null;
+      if (loginWatch.state !== 'watching') return;
+      loginWatch.attempts += 1;
+      try {
+        const r = await grabDoubao({ port });
+        if (r.ok) {
+          const parsed = parseCookieInput(r.cookie);
+          if (!saveAccountCookieImpl) throw new Error('账号入库函数还没就绪（webServer 未注册？）');
+          const saved = saveAccountCookieImpl(parsed.cookie, { remark: '从浏览器登录导入' });
+          loginWatch.state = 'done';
+          loginWatch.account = saved.id;
+          loginWatch.importedAt = Date.now();
+          loginWatch.lastReason = `已导入账号 ${saved.id}`;
+          log('info', `登录完成，已自动导入账号 ${saved.id}（${why}）`);
+          try { await closeBrowser(browserHandle || { port }); browserHandle = null; } catch (e) { /* 关不掉就算了 */ }
+          return;
+        }
+        loginWatch.lastReason = r.reason || r.stage || '还没检测到登录态';
+      } catch (e) {
+        loginWatch.lastReason = String(e.message || e);
+      }
+      if (Date.now() > deadline) {
+        loginWatch.state = 'timeout';
+        loginWatch.lastReason = '等了 5 分钟还没检测到登录态，请在窗口里完成登录后点「抓取 Cookie（并入库）」';
+        log('warn', '自动导入等待超时');
+        return;
+      }
+      loginWatchTimer = setTimeout(tick, 2500);
+      loginWatchTimer.unref?.();
+    };
+    loginWatchTimer = setTimeout(tick, 2000);
+    loginWatchTimer.unref?.();
+  };
 
   /**
    * 拿到 webServer 才注册；重复调用安全。
@@ -490,6 +559,13 @@ export function apply(ctx, rawConfig) {
             // 账号文件到底在哪：面板空态文案与排障都要用它（1.2.5 起不再在插件目录）
             dataDir: files.dir,
             accountsPath: files.accountsPath,
+            // 登录助手的自动导入状态（面板轮询它显示「已登录并自动导入」）
+            loginWatch: {
+              state: loginWatch.state,
+              account: loginWatch.account,
+              attempts: loginWatch.attempts,
+              reason: loginWatch.lastReason,
+            },
             // 宿主包从哪来的：bare=常规解析；install:<dir>=从安装目录取（profile 安装的正常情况）
             runtime: { host: { ...resolvedFrom }, version: VERSION },
             // 诊断字段：宿主最近一次实际下发的模型名 + 会话复用情况
@@ -691,6 +767,8 @@ export function apply(ctx, rawConfig) {
         writeAccountsFile(list);
         return { id: newId, created: true };
       };
+      // 交给登录后的自动导入用（见 startLoginWatch）
+      saveAccountCookieImpl = saveAccountCookie;
 
       register({
         kind: 'exact',
@@ -720,10 +798,13 @@ export function apply(ctx, rawConfig) {
               port: Number(body.port) || 0,
               startUrl: typeof body.startUrl === 'string' && body.startUrl ? body.startUrl : undefined,
             });
+            // 打开后就开始等：无论你在窗口里自己登录，还是用面板的登录助手，
+            // 一旦检测到登录态就自动入库，不用再点「抓取」
+            startLoginWatch(browserHandle.port, '打开导入窗口后');
             json(res, 200, {
               ok: true,
               ...browserHandle,
-              hint: '已打开一个独立的浏览器窗口（临时配置，不影响你日常浏览）。请在里面登录豆包，登录完成后点「抓取 Cookie」。',
+              hint: '已打开一个独立的浏览器窗口（临时配置，不影响你日常浏览）。在里面用手机号/扫码登录豆包，登录成功会自动导入，不用再点抓取。',
             });
           } catch (e) {
             json(res, 500, { ok: false, error: String(e.message || e) });
@@ -770,10 +851,65 @@ export function apply(ctx, rawConfig) {
 
       register({
         kind: 'exact',
+        path: '/doubao/browser/login',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = (await parseBody(req)) || {};
+          const action = ['probe', 'open', 'phone', 'code'].includes(String(body.action)) ? String(body.action) : 'probe';
+          const port = Number(body.port) || (browserHandle && browserHandle.port) || 9222;
+          try {
+            const r = await loginAssist({
+              port,
+              action,
+              phone: typeof body.phone === 'string' ? body.phone : '',
+              code: typeof body.code === 'string' ? body.code : '',
+            });
+            if (r.stage === 'sent' || r.stage === 'submitted' || r.stage === 'pending') {
+              startLoginWatch(port, '登录助手');
+            }
+            json(res, 200, {
+              ok: !!r.ok,
+              stage: r.stage,
+              steps: r.steps || [],
+              // 只回表单形状，不回填进去的手机号/验证码
+              form: summarizeForm(r.form),
+              port,
+            });
+          } catch (e) {
+            const msg = String(e.message || e);
+            const hint = !browserHandle && !Number(body.port)
+              ? '还没打开导入窗口：先点「从浏览器导入」，或把 port 传进来'
+              : (/fetch failed|ECONNREFUSED/i.test(msg) ? '调试端口没响应：窗口可能被关了，重新点一次「从浏览器导入」' : msg);
+            json(res, 500, { ok: false, error: hint, port });
+          }
+        },
+      });
+
+      register({
+        kind: 'exact',
+        path: '/doubao/browser/wait',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          json(res, 200, {
+            ok: true,
+            state: loginWatch.state,
+            attempts: loginWatch.attempts,
+            account: loginWatch.account,
+            imported: loginWatch.state === 'done',
+            sinceMs: loginWatch.startedAt ? Date.now() - loginWatch.startedAt : 0,
+            reason: loginWatch.lastReason,
+          });
+        },
+      });
+
+      register({
+        kind: 'exact',
         path: '/doubao/browser/close',
         handler: async (req, res) => {
           if (guard(req, res)) return;
           try {
+            stopLoginWatch();
+            if (loginWatch.state === 'watching') loginWatch.state = 'closed';
             const r = await closeBrowser(browserHandle || {});
             browserHandle = null;
             json(res, 200, r);
