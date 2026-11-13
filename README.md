@@ -19,7 +19,7 @@
 
 ## 安装
 
-1. 把本目录（4 个文件）放到 DSH 可访问的插件目录
+1. 把本目录放到 DSH 可访问的插件目录
 2. 按 DSH 插件bundle 机制挂载 `cordis.patch.yml`
 3. 在插件配置面板的 `accounts` 里填入豆包 Cookie（见下）
 4. 重启/刷新后，模型列表出现「豆包工作（免费额度）」
@@ -33,9 +33,11 @@
 ## 功能
 
 - **多账号池**：轮询/随机调度，Cookie 填多个即可
-- **冷却分级**：429/403 长冷却 24h（对应“第二天恢复”）、5xx 短冷却 5 分钟、Cookie 失效单独标记
+- **冷却分级**：429/403 长冷却 24h（对应“第二天恢复”）、5xx 空响应 短冷却 5 分钟、Cookie 失效单独标记
 - **单账号 RPM 限速**（默认 6/分钟，可配），防止高频触发风控
-- **失败自动换号重试**
+- **失败自动换号重试**；**流中断保护**：已经吐出内容后不再换号重发，避免用户看到重复文本
+- **错误码对齐宿主协议**：`QUOTA` / `RATE_LIMIT` / `AUTH` / `TRANSPORT` / `TIMEOUT` / `EMPTY_RESPONSE` /
+  `ABORTED` / `SERVER`，并由 `providerRetryPolicy` 声明哪些错误宿主可以补一次重试
 - **扩展模型**：后续抓到新的 `model_item_key` 可在 `extraModels` 配置里加
 
 ## 多账号与 Cookie 导入/导出（accounts.json）
@@ -98,16 +100,21 @@ dsh-doubao-work/
 插件带浏览器半身（`client.js`），重启 DSH 后会在 **设置 → 模型接入** 里多出一页「豆包工作」，
 直接显示账号池、今日用量、预估剩余额度，并支持健康检查 / 启用停用 / 删除账号。
 
-页面上还能「添加账号」（直接粘贴整段 Cookie，保存即生效）与「启用/停用/删除」。
+页面上还能「添加账号」（直接粘贴整段 Cookie，保存即生效）、「停用/启用」、「换 Cookie」与「删除」。
+停用的账号仍然显示在列表里（状态显示「已停用」），所以随时可以点回来启用。
 
-离线自检（不重启、不耗额度）：
+离线自检（不重启、不联网、不耗额度）：
 
 ```bash
-node tests/smoke.mjs     # 契约/路由/接口/会话闸门，共 13 项
+node tests/smoke.mjs      # 契约/路由/账号管理/错误码/流协议，共 40 项
+node tests/upstream.mjs   # 本地假上游：SSE 解析/换号/冷却/流中断/取消/会话复用，共 11 项
 ```
 
 数据来自宿主同源接口（双前缀，`/api/doubao/*` 与 `/doubao/*` 等价）：
-`/api/doubao/status`、`/api/doubao/check`、`/api/doubao/account/add|enable|remove`。
+`/api/doubao/status`、`/api/doubao/check`、`/api/doubao/account/add|update|enable|remove`。
+
+> 这些接口能增删账号、写本地文件，因此只接受**同源**请求：浏览器跨源 POST 的 `Origin`
+> 与 `Host` 不一致会直接 403。命令行（curl / 脚本）不带 `Origin`，照常可用。
 
 ## 本地面板
 
@@ -135,9 +142,9 @@ node tools/accounts.mjs export --out /tmp/backup.json
 
 ## 状态接口（插件内，需重启 DSH 后生效）
 
-- `GET  /doubao/status`（或 `/api/doubao/status`）— 账号池 + 今日用量 + 会话数
+- `GET  /doubao/status`（或 `/api/doubao/status`）— 账号池（含停用）+ 今日用量 + 会话数
 - `POST /doubao/check` — 逐账号健康检查
-- `POST /doubao/account/add|enable|remove` — 账号增删启停
+- `POST /doubao/account/add|update|enable|remove` — 账号增删改启停（`update` 用于换 Cookie，不用删了再加）
 
 ## 流式输出与推理档位（reasoningEffort）
 
@@ -164,8 +171,44 @@ node tools/accounts.mjs export --out /tmp/backup.json
 
 抓包结论、模型 `model_item_key` 对照表、SSE 事件表、额度接口、以及**尚未抓到**的签到接口和补抓方法，见 [`docs/豆包接口实测-2026-11-13.md`](docs/豆包接口实测-2026-11-13.md)。
 
+## 开发自测
+
+两套离线测试都不联网、不消耗豆包额度：
+
+```bash
+node tests/smoke.mjs      # 插件契约 + HTTP 管理接口 + 适配器流协议
+node tests/upstream.mjs   # 本地假豆包上游（SSE 帧与线上一致）
+```
+
+`tests/smoke.mjs` 会 `import('../index.js')`，因此需要能解析到 peer 依赖
+`@deepseek-ai/dsh-llm` 与 `@deepseek-ai/schemastery`。在本机开发时直接把 DSH 安装目录
+`resources/app.asar` 里 `dsh/node_modules/@deepseek-ai/` 的同版本包放到本仓库 `node_modules/` 下即可
+（`node_modules/` 已在 `.gitignore` 里）。装好真实包还有个好处：类型/字段名与宿主完全一致，
+不会测出一个"只在 mock 里成立"的协议。
+
+## 待办 / 已知缺口
+
+- `standalone/` 独立网关是**同逻辑的另一份实现**，尚未同步 1.2.0 的流中断保护与错误码修正，
+  后续应改为直接复用 `doubao.js`，避免两处漂移。
+- 8 个未抓 `model_item_key`（豆包 2.1 Pro / Kimi K3 / GLM 5.3 等），抓到即可加进 `extraModels`。
+- 签到接口在网页端不存在（详见 docs），插件侧只能做额度记账与提醒，无法自动签到。
+
 ## 更新记录
 
+- **1.2.0**（2026-11-13）：
+  - **停用账号重新可见**：此前 `enabled: false` 的账号会从设置页列表里消失，导致「停用」按下去就再也点不回来；
+    现在快照含停用账号，按钮改为按 `enabled` 判断，显示「启用 / 停用」。
+  - **流中断保护**：上游已经开始吐字后再断流，不再换号从头重发（用户会看到两段重复内容），
+    而是保留已输出部分并以 `finish: max-tokens` 告知宿主这段不完整。
+  - **错误码对齐宿主**：`quota → QUOTA`、`network → TRANSPORT`、`empty → EMPTY_RESPONSE`、
+    `timeout → TIMEOUT`、`aborted → ABORTED`（此前落在 `PROVIDER_UNAVAILABLE`/`UPSTREAM_ERROR` 这类宿主不认的码上），
+    并新增 `providerRetryPolicy`（`RATE_LIMIT` 不交给宿主立刻重试）。
+  - **真实原因不再被掩盖**：单账号出错冷却后，此前会抛「全部账号冷却中」，把真正的额度/空响应错误盖掉。
+  - **换 Cookie 接口** `POST /doubao/account/update` + 设置页「换 Cookie」按钮；配置面板账号的启停同样生效。
+  - **同源校验**：管理接口拒绝浏览器跨源请求（CSRF）。
+  - **用量估算**改为中文按宽字符计（此前一律 `长度/4`，中文严重低估）；`usage` 补 `totalTokens`。
+  - **测试**：新增 `tests/upstream.mjs`（本地假豆包上游，11 项），`tests/smoke.mjs` 扩到 40 项；
+    上游域名可经 `baseUrl` 配置替换，便于自测与镜像。
 - **1.1.3**（2026-11-13）：新增 `reasoningEffort` 配置项（默认 0，走真流式）。此前写死为 3，
   豆包工作模式在推理档 ≥1 时会先推理完再整段返回，导致界面"卡一下再出全文"、TTFT/TPS 统计偏低。
 - **1.1.2**（2026-11-13）：修复 `stream()` 中 `result` 变量作用域问题——此前每次生成完回复后都会抛

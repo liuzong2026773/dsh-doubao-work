@@ -36,6 +36,9 @@ window.__ModuleLoader__.load({
       add: (account) => req('/api/doubao/account/add', {
         method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(account),
       }),
+      update: (account) => req('/api/doubao/account/update', {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(account),
+      }),
     }
 
     const S = {
@@ -62,6 +65,7 @@ window.__ModuleLoader__.load({
 
     function statusColor(s) {
       if (s === '可用') return '#0a7d34'
+      if (s === '已停用') return '#888'
       if (String(s).includes('失效')) return '#c0392b'
       return '#b25e00'
     }
@@ -69,6 +73,7 @@ window.__ModuleLoader__.load({
     function Panel() {
       const [data, setData] = useState(null)
       const [showAdd, setShowAdd] = useState(false)
+      const [formMode, setFormMode] = useState('add') // 'add' | 'update'
       const [form, setForm] = useState({ id: '', remark: '', cookie: '' })
       const [err, setErr] = useState('')
       const [busy, setBusy] = useState('')
@@ -89,7 +94,23 @@ window.__ModuleLoader__.load({
         catch (e) { setLog('失败: ' + (e.message || e)) }
         setBusy(''); load()
       }
-      const onToggle = async a => { setBusy(a.id); try { await api.enable(a.id, a.status === '已停用') } catch (e) {} setBusy(''); load() }
+      const onToggle = async a => { setBusy(a.id); try { await api.enable(a.id, !a.enabled) } catch (e) {} setBusy(''); load() }
+      const openAdd = () => { setFormMode('add'); setForm({ id: '', remark: '', cookie: '' }); setShowAdd(true) }
+      const openUpdate = a => {
+        setFormMode('update')
+        setForm({ id: a.id, remark: a.remark || '', cookie: '' })
+        setShowAdd(true)
+      }
+      const onSave = async () => {
+        setBusy('add')
+        try {
+          const r = formMode === 'update' ? await api.update(form) : await api.add(form)
+          setLog((formMode === 'update' ? '已更新账号 ' : '已添加账号 ') + r.id)
+          setForm({ id: '', remark: '', cookie: '' })
+          setShowAdd(false)
+        } catch (e) { setLog('保存失败：' + e.message) }
+        setBusy(''); load()
+      }
       const onRemove = async a => {
         if (typeof confirm === 'function' && !confirm('确定删除账号 ' + a.id + ' ？')) return
         setBusy(a.id); try { await api.remove(a.id) } catch (e) {} setBusy(''); load()
@@ -117,29 +138,25 @@ window.__ModuleLoader__.load({
         h('div', { style: S.row },
           h('button', { style: S.btn, onClick: load, disabled: !!busy }, '刷新'),
           h('button', { style: S.btn, onClick: onCheck, disabled: !!busy }, busy === 'check' ? '检查中…' : '全部健康检查'),
-          h('button', { style: S.btn, onClick: () => setShowAdd(v => !v) }, showAdd ? '收起' : '添加账号')),
+          h('button', { style: S.btn, onClick: () => (showAdd ? setShowAdd(false) : openAdd()) }, showAdd ? '收起' : '添加账号')),
 
         showAdd ? h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8, padding: 12, borderRadius: 10, border: '1px solid var(--dsw-alias-border-l2, #e3e6ea)' } },
-          h('div', { style: S.mute }, '把浏览器里豆包网页版的整段 Cookie 粘进来；保存后立即生效，无需重启。'),
+          h('div', { style: S.mute }, formMode === 'update'
+            ? '粘贴该账号新的整段 Cookie（Cookie 过期时用这个换，不用删了再加）；保存后立即生效。'
+            : '把浏览器里豆包网页版的整段 Cookie 粘进来；保存后立即生效，无需重启。'),
           h('div', { style: S.row },
-            h('input', { placeholder: 'ID（可空，如 acc-2）', value: form.id, style: { flex: '0 1 160px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
-              onChange: e => setForm({ ...form, id: e.target.value }) }),
+            h('input', {
+              placeholder: 'ID（可空，如 acc-2）', value: form.id, disabled: formMode === 'update',
+              style: { flex: '0 1 160px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
+              onChange: e => setForm({ ...form, id: e.target.value }),
+            }),
             h('input', { placeholder: '备注（如：小号）', value: form.remark, style: { flex: '1 1 160px', padding: 6, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit' },
               onChange: e => setForm({ ...form, remark: e.target.value }) })),
           h('textarea', { placeholder: 'Cookie（sessionid=...; sid_guard=...）', rows: 3, value: form.cookie,
             style: { width: '100%', padding: 8, borderRadius: 6, border: '1px solid var(--dsw-alias-border-l2,#d0d5dc)', background: 'transparent', color: 'inherit', fontFamily: 'inherit', fontSize: 12 },
             onChange: e => setForm({ ...form, cookie: e.target.value }) }),
           h('div', { style: S.row },
-            h('button', { style: S.btn, disabled: !!busy, onClick: async () => {
-              setBusy('add')
-              try {
-                const r = await api.add(form)
-                setLog('已添加账号 ' + r.id)
-                setForm({ id: '', remark: '', cookie: '' })
-                setShowAdd(false)
-              } catch (e) { setLog('添加失败：' + e.message) }
-              setBusy(''); load()
-            } }, '保存'),
+            h('button', { style: S.btn, disabled: !!busy, onClick: onSave }, formMode === 'update' ? '更新 Cookie' : '保存'),
             h('button', { style: S.btn, onClick: () => setShowAdd(false) }, '取消'))) : null,
 
         h('table', { style: S.table },
@@ -156,7 +173,9 @@ window.__ModuleLoader__.load({
               h('td', { style: S.td }, String(a.totalChars ?? 0)),
               h('td', { style: { ...S.td, ...S.mute } }, a.lastError || '—'),
               h('td', { style: S.td },
-                h('button', { style: S.btn, disabled: !!busy, onClick: () => onToggle(a) }, '停用/启用'),
+                h('button', { style: S.btn, disabled: !!busy, onClick: () => onToggle(a) }, a.enabled === false ? '启用' : '停用'),
+                h('span', { style: { display: 'inline-block', width: 6 } }),
+                h('button', { style: S.btn, disabled: !!busy, onClick: () => openUpdate(a) }, '换 Cookie'),
                 h('span', { style: { display: 'inline-block', width: 6 } }),
                 h('button', { style: S.btn, disabled: !!busy, onClick: () => onRemove(a) }, '删除')))))),
 

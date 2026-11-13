@@ -57,6 +57,8 @@ export class DoubaoClient {
   constructor(config, opts = {}) {
     this.cfg = config;
     this.log = opts.log || (() => {});
+    // 上游站点可替换：默认豆包网页版；测试/自托管镜像时改 baseUrl 指向 mock 服务器
+    this.baseUrl = (config.baseUrl || 'https://www.doubao.com').replace(/\/+$/, '');
     this.statePath = opts.statePath;
     this.accountsPath = opts.accountsPath; // accounts.json 热加载（改文件即生效，无需重启）
     this.state = this._loadState();
@@ -180,13 +182,28 @@ export class DoubaoClient {
     }
   }
 
-  _accounts() {
+  /** 合并后的全部账号（含 enabled:false 的停用账号），用于设置页展示与启停操作 */
+  _allAccounts() {
     this._syncAccountsFile();
     const configAccounts = (this.cfg.accounts || []).map((a, i) => ({ ...a, id: a.id || `acc-${i + 1}` }));
     const merged = new Map();
     for (const a of configAccounts) merged.set(a.id, a);
     for (const a of this._accountsFileAccounts) merged.set(a.id, a); // 同 id 文件优先
-    return [...merged.values()].filter(a => a.enabled !== false && typeof a.cookie === 'string' && a.cookie.trim().length > 20);
+    return [...merged.values()].filter(a => typeof a.cookie === 'string' && a.cookie.trim().length > 20);
+  }
+
+  _accounts() {
+    return this._allAccounts().filter(a => a.enabled !== false);
+  }
+
+  /** 公开接口：全部账号（含停用），管理接口需要拿 Cookie 做覆盖写 */
+  allAccounts() {
+    return this._allAccounts();
+  }
+
+  /** 公开接口：某账号的运行态；管理接口换 Cookie 后清失效标记用 */
+  accountState(id) {
+    return this._accState(id);
   }
 
   _validAccounts() {
@@ -250,14 +267,18 @@ export class DoubaoClient {
     const base = this.cfg.dailyQuota ?? 200;
     const quota = isMondayCN() ? base * 2 : base; // 周一翻倍
     const today = dayKeyCN();
-    return this._accounts().map(a => {
+    // 注意：这里必须用 _allAccounts()，否则停用的账号在设置页里消失、再也点不回来
+    return this._allAccounts().map(a => {
       const st = this._accState(a.id);
       const now = Date.now();
       if (st.day !== today) { st.day = today; st.dayReq = 0; st.dayChars = 0; }
       const todayReq = st.dayReq || 0;
+      const enabled = a.enabled !== false;
       return {
-        id: a.id, remark: a.remark || '', enabled: a.enabled !== false,
-        status: st.authError ? 'Cookie失效' : (st.coolUntil > now ? `冷却至 ${new Date(st.coolUntil).toLocaleTimeString('zh-CN')}` : '可用'),
+        id: a.id, remark: a.remark || '', enabled,
+        status: !enabled ? '已停用'
+          : st.authError ? 'Cookie失效'
+            : (st.coolUntil > now ? `冷却至 ${new Date(st.coolUntil).toLocaleTimeString('zh-CN')}` : '可用'),
         totalReq: st.totalReq || 0, totalChars: st.totalChars || 0,
         todayReq, todayChars: st.dayChars || 0,
         quotaLeftEst: Math.max(0, quota - todayReq),
@@ -275,7 +296,7 @@ export class DoubaoClient {
     const results = [];
     for (const a of this._accounts()) {
       try {
-        const r = await fetch('https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/?aid=497858&version_code=20800', {
+        const r = await fetch(this.baseUrl + '/alice/commerce/sale/subscription/quota/summary/?aid=497858&version_code=20800', {
           method: 'POST',
           headers: { 'content-type': 'application/json', cookie: a.cookie.trim(), 'user-agent': UA },
           body: '{}',
@@ -365,7 +386,7 @@ export class DoubaoClient {
       web_platform: 'browser',
       web_tab_id: uuid(),
     });
-    return 'https://www.doubao.com/chat/completion?' + p.toString();
+    return this.baseUrl + '/chat/completion?' + p.toString();
   }
 
   /** 合并"上游超时"与调用方取消信号，避免 SSE 卡死到 DSH 超时 */
@@ -380,7 +401,7 @@ export class DoubaoClient {
   async getQuota(account) {
     let res;
     try {
-      res = await fetch('https://www.doubao.com/alice/commerce/sale/subscription/quota/summary/?aid=497858&version_code=20800', {
+      res = await fetch(this.baseUrl + '/alice/commerce/sale/subscription/quota/summary/?aid=497858&version_code=20800', {
         method: 'POST',
         headers: { 'content-type': 'application/json', cookie: account.cookie.trim(), 'user-agent': UA },
         body: '{}',
@@ -431,15 +452,26 @@ export class DoubaoClient {
 
   /**
    * 单账号单次上游调用
-   * @returns {AsyncGenerator<string, string>} AI 文本增量（return 值为全文）
+   * @param attempt 可选的外层记账对象 { text, conversationId }：流中途出错时，
+   *   调用方（chat）靠它判断"已经吐出内容"，从而不再换号重发（重发会让用户看到重复文本）。
+   * @returns {AsyncGenerator<string, {text: string, conversationId: string}>} AI 文本增量（return 值为全文）
    */
-  async *chatOnce(account, modelItemKey, text, signal, conversationId = '') {
+  async *chatOnce(account, modelItemKey, text, signal, conversationId = '', attempt = null) {
     const startedAt = Date.now();
     const st = this._accState(account.id);
     st.lastReqTimes = st.lastReqTimes || [];
     st.lastReqTimes.push(Date.now());
     st.totalReq++;
     this._scheduleSave();
+    // 记账对象：让上层看到"已输出多少 / 服务端会话号是多少"
+    const sink = attempt || { text: '', conversationId: '' };
+
+    /** 归类中止：区分"调用方取消"和"上游超时"，两者在 DSH 里处置方式不同 */
+    const abortKind = (e) => {
+      if (signal?.aborted) return new DoubaoError('aborted', '请求已取消');
+      if (e?.name === 'TimeoutError') return new DoubaoError('timeout', `上游超时（${this.cfg.requestTimeoutMs ?? 180000}ms）`);
+      return null;
+    };
 
     let res;
     try {
@@ -457,7 +489,7 @@ export class DoubaoClient {
         signal: this._withTimeout(signal),
       });
     } catch (e) {
-      throw new DoubaoError('network', `上游网络错误: ${e.message}`);
+      throw abortKind(e) || new DoubaoError('network', `上游网络错误: ${e.message}`);
     }
 
     if (!res.ok) {
@@ -490,10 +522,18 @@ export class DoubaoClient {
     let full = '';
     let ended = false;
     let ackConv = '';
+    /** 累加并透出增量，同时写进上层记账对象 */
+    const push = (t) => { full += t; sink.text = full; return t; };
     try {
       while (!ended) {
         if (signal?.aborted) throw new DoubaoError('aborted', '请求已取消');
-        const { done, value } = await reader.read();
+        let chunk;
+        try {
+          chunk = await reader.read();
+        } catch (e) {
+          throw abortKind(e) || new DoubaoError('network', `上游流读取中断: ${e.message}`);
+        }
+        const { done, value } = chunk;
         // flush 尾部残留字节，避免多字节字符被截断
         if (done) buf += dec.decode();
         else buf += dec.decode(value, { stream: true });
@@ -514,27 +554,27 @@ export class DoubaoClient {
           try {
             if (evName === 'CHUNK_DELTA') {
               const d = JSON.parse(dataStr);
-              if (typeof d.text === 'string' && d.text) { full += d.text; yield d.text; }
+              if (typeof d.text === 'string' && d.text) yield push(d.text);
             } else if (evName === 'STREAM_CHUNK') {
               const d = JSON.parse(dataStr);
               for (const op of d.patch_op || []) {
                 if (op.patch_object !== 1) continue;
                 for (const b of op?.patch_value?.content_block || []) {
                   const t = b?.content?.text_block?.text;
-                  if (typeof t === 'string' && t) { full += t; yield t; }
+                  if (typeof t === 'string' && t) yield push(t);
                 }
               }
             } else if (evName === 'STREAM_MSG_NOTIFY') {
               const d = JSON.parse(dataStr);
               for (const b of d?.content?.content_block || []) {
                 const t = b?.content?.text_block?.text;
-                if (typeof t === 'string' && t) { full += t; yield t; }
+                if (typeof t === 'string' && t) yield push(t);
               }
             } else if (evName === 'SSE_ACK') {
               // 记录服务端分配的 conversation_id，供下一轮复用上下文
               const d = JSON.parse(dataStr);
               const ci = d?.ack_client_meta?.conversation_info;
-              if (ci?.conversation_id) ackConv = String(ci.conversation_id);
+              if (ci?.conversation_id) { ackConv = String(ci.conversation_id); sink.conversationId = ackConv; }
             } else if (evName === 'SSE_REPLY_END' || evName === 'STREAM_FINISH' || evName === 'DONE') {
               ended = true;
             }
@@ -555,6 +595,7 @@ export class DoubaoClient {
     this.log('info', `上游完成 账号=${account.id} 字数=${full.length} 耗时=${ms}ms`, { acc: account.id, ms, chars: full.length });
 
     if (!full) throw new DoubaoError('empty', '上游未返回内容（可能触发风控/额度不足/参数被风）');
+    sink.conversationId = ackConv || conversationId;
     return { text: full, conversationId: ackConv || conversationId };
   }
 
@@ -573,6 +614,8 @@ export class DoubaoClient {
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
       const acc = this.pickAccount(tried);
       if (!acc) {
+        // 本轮已经真试过账号（并且把它冷却了）：报出真实原因，别用"全部冷却中"盖掉它
+        if (lastErr) throw lastErr;
         const accounts = this._accounts();
         if (accounts.length === 0) throw new DoubaoError('noaccount', '没有可用账号：请检查 accounts 配置（cookie 是否已填、是否启用）');
         const st = this._accState(accounts[0].id);
@@ -589,13 +632,21 @@ export class DoubaoClient {
         continue;
       }
       if (wait > 0) await new Promise(r => setTimeout(r, wait));
+      // 每个账号一次记账：流中途失败时据此判断"是否已经吐字"，已吐字就不再换号重发
+      const attempt = { text: '', conversationId: '' };
       try {
-        const full = yield* this.chatOnce(acc, modelItemKey, text, signal, opts.conversationId || '');
+        const full = yield* this.chatOnce(acc, modelItemKey, text, signal, opts.conversationId || '', attempt);
         return full;
       } catch (e) {
         if (e instanceof DoubaoError) {
           lastErr = e;
           if (e.kind === 'aborted') throw e;
+          if (attempt.text) {
+            // 已经向调用方输出过内容：换号重发会导致重复文本，宁可截断并如实标记
+            this.coolAccount(acc, this.cfg.shortCoolSeconds ?? 300, `流中断（已输出 ${attempt.text.length} 字）：${e.message}`);
+            this.log('warn', `账号 ${acc.id} 流中断，保留已输出内容（${attempt.text.length} 字），不再换号重发`);
+            return { text: attempt.text, conversationId: attempt.conversationId || opts.conversationId || '', truncated: true };
+          }
           if (e.kind === 'auth') this.markAuthError(acc, e.message);
           else if (e.kind === 'quota') this.coolUntilMidnight(acc, e.message);
           else if (e.kind === 'ratelimit') {
@@ -603,7 +654,7 @@ export class DoubaoClient {
             const sec = e.retryAfter > 0 ? Math.min(e.retryAfter, 86400) : (this.cfg.coolSeconds ?? 86400);
             this.coolAccount(acc, sec, e.message);
           }
-          else if (e.kind === 'upstream' || e.kind === 'empty') this.coolAccount(acc, this.cfg.shortCoolSeconds ?? 300, e.message);
+          else if (e.kind === 'upstream' || e.kind === 'empty' || e.kind === 'timeout') this.coolAccount(acc, this.cfg.shortCoolSeconds ?? 300, e.message);
           // network：不冷却，直接换号重试
           this.log('warn', `账号 ${acc.id} 尝试失败(${e.kind})：${e.message}，尝试下一个账号`);
           continue;

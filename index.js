@@ -57,6 +57,31 @@ function blockText(blocks) {
   return blocks.filter(b => b?.type === 'text').map(b => b.text).join('\n');
 }
 
+/**
+ * 粗略 token 估算（只用于 usage 上报，不参与计费）。
+ * 中文/全角约 1 字 1 token，ASCII 约 4 字符 1 token——比一律 length/4 更接近真实。
+ */
+function estimateTokens(text) {
+  const s = String(text || '');
+  if (!s) return 0;
+  let wide = 0;
+  for (const ch of s) if (/[\u2e80-\u9fff\u3000-\u303f\uff00-\uffef]/.test(ch)) wide++;
+  return Math.max(1, Math.ceil(wide + (s.length - wide) / 4));
+}
+
+/** DoubaoError.kind → DSH 的错误码（宿主靠 code 做重试/提示路由，不要自己发明语义） */
+export const ERROR_CODES = {
+  auth: 'AUTH',
+  ratelimit: 'RATE_LIMIT',
+  quota: 'QUOTA',
+  noaccount: 'NO_ADAPTER',
+  network: 'TRANSPORT',
+  timeout: 'TIMEOUT',
+  empty: 'EMPTY_RESPONSE',
+  aborted: 'ABORTED',
+  upstream: 'SERVER',
+};
+
 /** DSH Message[] + system → 豆包单段文本（每次新建会话，需自带完整上下文） */
 function messagesToText(options) {
   const msgs = options.messages || [];
@@ -86,15 +111,28 @@ function messagesToText(options) {
 
 // ---------------- LlmAdapter ----------------
 
-class DoubaoLlmAdapter extends LlmAdapter {
+export class DoubaoLlmAdapter extends LlmAdapter {
   /** @param {{ client: DoubaoClient, config: object, log: Function }} deps */
   constructor(deps) {
     super();
     this.deps = deps;
   }
-
   providerInfo(provider) {
     return { id: provider, name: this.deps.config.providerName || '豆包工作（免费额度）' };
+  }
+
+  /**
+   * 宿主侧重试策略：账号池内部已经做了换号重试与冷却，
+   * 这里只允许宿主对"瞬时类"错误补一次机会；RATE_LIMIT 除外——
+   * 换号冷却动辄数小时，宿主立刻重试只会再撞一次墙。
+   */
+  providerRetryPolicy() {
+    return {
+      mode: 'normal',
+      maxRetries: 1,
+      retryableCodes: ['EMPTY_RESPONSE', 'SERVER', 'TRANSPORT', 'TIMEOUT'],
+      backoff: { initialDelayMs: 800, maxDelayMs: 5000, jitterRatio: 0.2 },
+    };
   }
 
   async listModels(provider) {
@@ -161,25 +199,26 @@ class DoubaoLlmAdapter extends LlmAdapter {
       }
     } catch (e) {
       const kind = e instanceof DoubaoError ? e.kind : 'upstream';
-      const codeMap = { auth: 'AUTH', ratelimit: 'RATE_LIMIT', noaccount: 'NO_ADAPTER', network: 'PROVIDER_UNAVAILABLE', empty: 'UPSTREAM_ERROR' };
-      const code = codeMap[kind] || 'PROVIDER_ERROR';
-      throw new LlmError(e.message || '豆包上游调用失败', code, { status: e.status });
+      throw new LlmError(e.message || '豆包上游调用失败', ERROR_CODES[kind] || 'PROVIDER_ERROR', { status: e.status });
     }
 
     if (first) {
       // 没有任何增量就结束了
-      throw new LlmError('豆包上游未返回内容', 'UPSTREAM_ERROR');
+      throw new LlmError('豆包上游未返回内容', 'EMPTY_RESPONSE');
     }
 
     // 记住服务端分配的会话号，供下一轮复用
     if (result?.conversationId) client.rememberConversation(convKey, result.conversationId, msgs.length, full);
 
     yield { type: 'block-end', index: 0, block: { type: 'text', text: full } };
+    const tokens = { inputTokens: estimateTokens(text), outputTokens: estimateTokens(full) };
     yield {
       type: 'usage',
-      usage: { inputTokens: Math.ceil(text.length / 4), outputTokens: Math.ceil(full.length / 4) },
+      usage: { ...tokens, totalTokens: tokens.inputTokens + tokens.outputTokens },
     };
-    yield { type: 'finish', reason: { kind: 'stop' } };
+    // 流中断保底返回的部分文本，用 max-tokens 让宿主知道这一段不完整
+    yield { type: 'finish', reason: { kind: result?.truncated ? 'max-tokens' : 'stop' } };
+    if (result?.truncated) log('warn', `豆包流中断，返回了部分内容（${full.length} 字）`);
     log('info', `调用完成 模型=${model} 字数=${full.length} 耗时=${Date.now() - startedAt}ms`);
   }
 }
@@ -234,6 +273,7 @@ export function apply(ctx, config) {
         kind: 'exact',
         path: '/doubao/status',
         handler: (req, res) => {
+          if (guard(req, res)) return;
           const snap = client.snapshot();
           const body = JSON.stringify({
             provider: config.providerId,
@@ -242,8 +282,9 @@ export function apply(ctx, config) {
             summary: {
               accounts: snap.length,
               usable: snap.filter(a => a.status === '可用').length,
+              disabled: snap.filter(a => !a.enabled).length,
               todayReq: snap.reduce((s, a) => s + a.todayReq, 0),
-              quotaLeftEst: snap.reduce((s, a) => s + a.quotaLeftEst, 0),
+              quotaLeftEst: snap.filter(a => a.enabled).reduce((s, a) => s + a.quotaLeftEst, 0),
             },
             conversations: client.convMap.size,
             contextReuse: config.contextReuse !== false,
@@ -268,41 +309,109 @@ export function apply(ctx, config) {
         req.on('data', c => { b += c; });
         req.on('end', () => resolve(b));
       });
+      /** 解析 JSON 请求体；非法 JSON 返回 null（调用方回 400，别让异常冒到宿主） */
+      const parseBody = async (req) => {
+        try {
+          const raw = await readBody(req);
+          return raw.trim() ? JSON.parse(raw) : {};
+        } catch (e) { return null; }
+      };
+      /**
+       * 浏览器发起的跨源 POST 一定带 Origin；同源请求与命令行（curl / 运维脚本）没有。
+       * 插件接口能增删账号、写文件，挡掉"任意网页访问本机插件口"这一类 CSRF。
+       */
+      const sameOrigin = (req) => {
+        const origin = req.headers?.origin;
+        if (!origin) return true;
+        try {
+          const host = String(req.headers?.host || '').replace(/^https?:\/\//, '');
+          return new URL(origin).host === host;
+        } catch (e) { return false; }
+      };
+      const json = (res, code, obj) => {
+        res.writeHead(code, { 'content-type': 'application/json; charset=utf-8' });
+        res.end(JSON.stringify(obj, null, 2));
+      };
+      const guard = (req, res) => {
+        if (sameOrigin(req)) return false;
+        json(res, 403, { error: '已拒绝跨源请求（Origin 与 Host 不一致）' });
+        return true;
+      };
+      const ID_RE = /^[A-Za-z0-9_.\u4e00-\u9fa5-]{1,64}$/;
 
       register({
         kind: 'exact',
         path: '/doubao/account/enable',
         handler: async (req, res) => {
-          const body = JSON.parse((await readBody(req)) || '{}');
+          if (guard(req, res)) return;
+          const body = await parseBody(req);
+          if (!body || typeof body.id !== 'string' || !ID_RE.test(body.id)) return json(res, 400, { error: 'id 非法' });
           const list = readAccountsFile();
-          const a = list.find(x => x.id === body.id);
-          if (!a) { res.writeHead(404, { 'content-type': 'application/json' }); return res.end(JSON.stringify({ error: 'not found' })); }
+          let a = list.find(x => x.id === body.id);
+          if (!a) {
+            // 账号来自插件配置面板（不在 accounts.json 里）：借它的 Cookie 建一条覆盖记录，
+            // 这样"停用/启用"对配置面板账号同样生效（同 id 时文件账号优先）
+            const known = client.allAccounts().find(x => x.id === body.id);
+            if (!known) return json(res, 404, { error: 'not found', id: body.id });
+            a = { id: known.id, remark: known.remark || '', cookie: known.cookie, enabled: true };
+            list.push(a);
+          }
           a.enabled = !!body.enabled;
           writeAccountsFile(list);
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
+          json(res, 200, { ok: true, id: a.id, enabled: a.enabled });
         },
       });
       register({
         kind: 'exact',
         path: '/doubao/account/add',
         handler: async (req, res) => {
-          const body = JSON.parse((await readBody(req)) || '{}');
+          if (guard(req, res)) return;
+          const body = await parseBody(req);
+          if (!body) return json(res, 400, { error: '请求体不是合法 JSON' });
           const cookie = typeof body.cookie === 'string' ? body.cookie.trim() : '';
-          if (cookie.length < 20) {
-            res.writeHead(400, { 'content-type': 'application/json' });
-            return res.end(JSON.stringify({ error: 'Cookie 太短，疑似无效' }));
-          }
+          if (cookie.length < 20) return json(res, 400, { error: 'Cookie 太短，疑似无效' });
+          const remark = typeof body.remark === 'string' ? body.remark.trim().slice(0, 64) : '';
           const list = readAccountsFile();
-          const id = (body.id || '').trim() || ('acc-' + (list.length + 1));
-          if (list.some(a => a.id === id)) {
-            res.writeHead(409, { 'content-type': 'application/json' });
-            return res.end(JSON.stringify({ error: 'id 已存在：' + id }));
+          let id = typeof body.id === 'string' ? body.id.trim() : '';
+          if (id && !ID_RE.test(id)) return json(res, 400, { error: 'id 只能包含字母数字下划线点和中文，最长 64' });
+          if (!id) {
+            let n = list.length + 1;
+            while (list.some(a => a.id === `acc-${n}`)) n++;
+            id = `acc-${n}`;
           }
-          list.push({ id, remark: (body.remark || '').trim(), cookie, enabled: true });
+          if (list.some(a => a.id === id)) return json(res, 409, { error: 'id 已存在：' + id });
+          list.push({ id, remark, cookie, enabled: true });
           writeAccountsFile(list);
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: true, id }));
+          json(res, 200, { ok: true, id });
+        },
+      });
+
+      // 换 Cookie / 改备注（Cookie 过期是最常见的运维动作，不必删了再加）
+      register({
+        kind: 'exact',
+        path: '/doubao/account/update',
+        handler: async (req, res) => {
+          if (guard(req, res)) return;
+          const body = await parseBody(req);
+          if (!body || typeof body.id !== 'string' || !ID_RE.test(body.id)) return json(res, 400, { error: 'id 非法' });
+          const cookie = typeof body.cookie === 'string' ? body.cookie.trim() : '';
+          if (body.cookie !== undefined && cookie.length < 20) return json(res, 400, { error: 'Cookie 太短，疑似无效' });
+          const list = readAccountsFile();
+          let a = list.find(x => x.id === body.id);
+          if (!a) {
+            const known = client.allAccounts().find(x => x.id === body.id);
+            if (!known) return json(res, 404, { error: 'not found', id: body.id });
+            a = { id: known.id, remark: known.remark || '', cookie: known.cookie, enabled: known.enabled !== false };
+            list.push(a);
+          }
+          if (cookie) a.cookie = cookie;
+          if (typeof body.remark === 'string') a.remark = body.remark.trim().slice(0, 64);
+          a.enabled = true;
+          writeAccountsFile(list);
+          // Cookie 变了就清掉运行态的"失效"标记，下次调用立刻重试
+          const st = client.accountState ? client.accountState(body.id) : null;
+          if (st) { st.authError = false; st.lastError = ''; st.coolUntil = 0; }
+          json(res, 200, { ok: true, id: a.id });
         },
       });
 
@@ -310,10 +419,11 @@ export function apply(ctx, config) {
         kind: 'exact',
         path: '/doubao/account/remove',
         handler: async (req, res) => {
-          const body = JSON.parse((await readBody(req)) || '{}');
+          if (guard(req, res)) return;
+          const body = await parseBody(req);
+          if (!body || typeof body.id !== 'string' || !ID_RE.test(body.id)) return json(res, 400, { error: 'id 非法' });
           writeAccountsFile(readAccountsFile().filter(x => x.id !== body.id));
-          res.writeHead(200, { 'content-type': 'application/json' });
-          res.end(JSON.stringify({ ok: true }));
+          json(res, 200, { ok: true });
         },
       });
 
@@ -321,13 +431,12 @@ export function apply(ctx, config) {
         kind: 'exact',
         path: '/doubao/check',
         handler: async (req, res) => {
+          if (guard(req, res)) return;
           try {
             const results = await client.checkAll();
-            res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ results }, null, 2));
+            json(res, 200, { results });
           } catch (e) {
-            res.writeHead(500, { 'content-type': 'application/json; charset=utf-8' });
-            res.end(JSON.stringify({ error: e.message }));
+            json(res, 500, { error: e.message });
           }
         },
       });
