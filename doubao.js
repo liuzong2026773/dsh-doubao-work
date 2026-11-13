@@ -20,6 +20,7 @@ const BOT_ID = '7338286299411103781';
 const UA = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36';
 
 const uuid = () => crypto.randomUUID();
+const shortHash = (s) => crypto.createHash('sha1').update(String(s || '')).digest('hex').slice(0, 16);
 
 // ---- 额度按「北京时间自然日」结算 ----
 const CN_OFFSET = 8 * 3600 * 1000;
@@ -304,19 +305,21 @@ export class DoubaoClient {
    * 判断某对话能否复用已有 conversation_id。
    * 仅在消息「严格追加一条」时复用；历史被改写/压缩就新建，避免上下文错位。
    */
-  reusableConversation(key, msgCount) {
+  reusableConversation(key, msgCount, lastReplyText) {
     if (!key || this.cfg.contextReuse === false) return null;
     const e = this.convMap.get(key);
     if (!e) return null;
     const ttlMs = (this.cfg.conversationTtlSec ?? 1800) * 1000;
     if (Date.now() - e.ts > ttlMs) { this.convMap.delete(key); return null; }
     if (msgCount !== e.msgCount + 1) return null;
+    // 用上一轮我们实际返回的内容做一致性校验，防止两段不同对话首句相同而串号
+    if (e.replyHash && shortHash(lastReplyText) !== e.replyHash) return null;
     return e.conversationId;
   }
 
-  rememberConversation(key, conversationId, msgCount) {
+  rememberConversation(key, conversationId, msgCount, replyText) {
     if (!key || !conversationId) return;
-    this.convMap.set(key, { conversationId, msgCount, ts: Date.now() });
+    this.convMap.set(key, { conversationId, msgCount, ts: Date.now(), replyHash: shortHash(replyText) });
     this._scheduleSave();
     if (this.convMap.size > 100) {
       const oldest = [...this.convMap.entries()].sort((a, b) => a[1].ts - b[1].ts)[0];
