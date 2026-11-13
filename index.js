@@ -145,9 +145,9 @@ class DoubaoLlmAdapter extends LlmAdapter {
 
     let full = '';
     let first = true;
+    let result = null;
     try {
       const gen = client.chat(model, text, signal, { conversationId: reuseId || '' });
-      let result = null;
       while (true) {
         const { value: delta, done } = await gen.next();
         if (done) { result = delta; full = delta?.text || full; break; }

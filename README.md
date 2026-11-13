@@ -151,6 +151,13 @@ node tools/accounts.mjs export --out /tmp/backup.json
 
 抓包结论、模型 `model_item_key` 对照表、SSE 事件表、额度接口、以及**尚未抓到**的签到接口和补抓方法，见 [`docs/豆包接口实测-2026-11-13.md`](docs/豆包接口实测-2026-11-13.md)。
 
+## 更新记录
+
+- **1.1.2**（2026-11-13）：修复 `stream()` 中 `result` 变量作用域问题——此前每次生成完回复后都会抛
+  `ReferenceError: result is not defined`，导致 DSH 把回合判为失败（表现为“豆包模型用不了”）。
+- **1.1.1**：改用 `/api/doubao/*` 接口前缀，兼容只派发 `/api` 的宿主。
+- **1.1.0**：会话复用增加回复哈希校验，防止串会话。
+
 ## License
 
 MIT
